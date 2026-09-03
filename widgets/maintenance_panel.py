@@ -1,8 +1,13 @@
+import os
 import re
 import shlex
+import subprocess
 import time
 
-from pathlib import PurePosixPath
+from pathlib import (
+    Path,
+    PurePosixPath,
+)
 
 from PySide6.QtCore import (
     QObject,
@@ -11,6 +16,7 @@ from PySide6.QtCore import (
 )
 
 from PySide6.QtWidgets import (
+    QFileDialog,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -60,12 +66,16 @@ class MaintenanceOperation:
         ssh,
         config: AppConfig,
         operation,
+        backup_destination=None,
         sudo_password_getter=None,
         log_callback=None,
     ):
         self.ssh = ssh
         self.config = config
         self.operation = operation
+        self.backup_destination = (
+            backup_destination
+        )
         self.sudo_password_getter = (
             sudo_password_getter
         )
@@ -215,6 +225,357 @@ class MaintenanceOperation:
             )
 
         return stdout
+
+    # ========================================================
+    # BACKUP
+    # ========================================================
+
+    def _validate_backup_config(self):
+        """
+        Validate the actual SSH configuration stored in
+        AppConfig.
+
+        No hostname, username, key, port, or server path is
+        guessed here.
+
+        The user must configure the connection in Settings.
+        """
+
+        host = str(
+            self.config.host
+            or ""
+        ).strip()
+
+        username = str(
+            self.config.username
+            or ""
+        ).strip()
+
+        key_path = str(
+            self.config.key_path
+            or ""
+        ).strip()
+
+        server_root = str(
+            self.config.server_root
+            or ""
+        ).strip().rstrip("/")
+
+        port = self.config.port
+
+        missing = []
+
+        if not host:
+            missing.append(
+                "SSH Host"
+            )
+
+        if not username:
+            missing.append(
+                "SSH Username"
+            )
+
+        if not key_path:
+            missing.append(
+                "SSH Private Key"
+            )
+
+        if not server_root:
+            missing.append(
+                "Server Root"
+            )
+
+        if missing:
+            raise RuntimeError(
+                "SSH/server configuration is incomplete.\n\n"
+                "Please open the Settings panel and configure:\n\n"
+                + "\n".join(
+                    f"• {item}"
+                    for item in missing
+                )
+            )
+
+        try:
+            port = int(port)
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            raise RuntimeError(
+                "The configured SSH port is invalid.\n\n"
+                "Please check the SSH settings."
+            )
+
+        if port < 1 or port > 65535:
+            raise RuntimeError(
+                "The configured SSH port must be between "
+                "1 and 65535.\n\n"
+                "Please check the SSH settings."
+            )
+
+        key_file = Path(
+            key_path
+        ).expanduser()
+
+        if not key_file.exists():
+            raise RuntimeError(
+                "The configured SSH private key was not found:\n\n"
+                f"{key_file}\n\n"
+                "Please check the SSH settings."
+            )
+
+        if not key_file.is_file():
+            raise RuntimeError(
+                "The configured SSH private key is not a file:\n\n"
+                f"{key_file}\n\n"
+                "Please check the SSH settings."
+            )
+
+        return (
+            host,
+            username,
+            port,
+            str(key_file),
+            server_root,
+        )
+
+    def _backup(self):
+        """
+        Back up the configured server root to the selected
+        local destination using the user's configured SSH
+        connection and rsync.
+
+        Equivalent to:
+
+            rsync -avz --progress \
+                -e "ssh -p PORT -i KEY" \
+                USER@HOST:/server/root/ \
+                /local/destination/
+        """
+
+        self._log("")
+        self._log("=" * 64)
+        self._log("Starting Server Backup")
+        self._log("=" * 64)
+
+        # ----------------------------------------------------
+        # STEP 1
+        # ----------------------------------------------------
+
+        self._log(
+            "Step 1/4: Checking the SSH connection..."
+        )
+
+        self._check_connection()
+
+        # ----------------------------------------------------
+        # STEP 2
+        # ----------------------------------------------------
+
+        self._log(
+            "Step 2/4: Validating configured SSH settings..."
+        )
+
+        (
+            host,
+            username,
+            port,
+            key_path,
+            server_root,
+        ) = self._validate_backup_config()
+
+        destination = str(
+            self.backup_destination
+            or ""
+        ).strip()
+
+        if not destination:
+            raise RuntimeError(
+                "No backup destination was selected."
+            )
+
+        destination_path = Path(
+            destination
+        ).expanduser()
+
+        if not destination_path.exists():
+            destination_path.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+        if not destination_path.is_dir():
+            raise RuntimeError(
+                "The selected backup destination "
+                "is not a directory:\n"
+                f"{destination_path}"
+            )
+
+        self._log(
+            f"SSH host: {host}"
+        )
+
+        self._log(
+            f"SSH port: {port}"
+        )
+
+        self._log(
+            f"SSH username: {username}"
+        )
+
+        self._log(
+            f"SSH key: {key_path}"
+        )
+
+        self._log(
+            f"Remote source: "
+            f"{server_root}/"
+        )
+
+        self._log(
+            f"Local destination: "
+            f"{destination_path}"
+        )
+
+        # ----------------------------------------------------
+        # STEP 3
+        # ----------------------------------------------------
+
+        self._log("")
+        self._log(
+            "Step 3/4: Running rsync..."
+        )
+
+        ssh_command = (
+            "ssh "
+            f"-p {port} "
+            f"-i {shlex.quote(key_path)}"
+        )
+
+        source = (
+            f"{username}@{host}:"
+            f"{server_root}/"
+        )
+
+        command = [
+            "rsync",
+            "-avz",
+            "--progress",
+            "-e",
+            ssh_command,
+            source,
+            str(destination_path) + os.sep,
+        ]
+
+        # Do not print the private key path as part of a shell
+        # command that could be copied into a log or terminal.
+        self._log(
+            "Using rsync over the configured SSH connection."
+        )
+
+        self._log(
+            f"Source: {source}"
+        )
+
+        self._log(
+            f"Destination: {destination_path}"
+        )
+
+        self._log("")
+
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+            )
+
+        except FileNotFoundError:
+            raise RuntimeError(
+                "rsync was not found on this PC.\n\n"
+                "Please install rsync and make sure it is "
+                "available in your PATH."
+            )
+
+        except Exception as error:
+            raise RuntimeError(
+                "Could not start rsync:\n"
+                f"{error}"
+            )
+
+        # ----------------------------------------------------
+        # STREAM RSYNC OUTPUT
+        # ----------------------------------------------------
+
+        try:
+            while True:
+                line = (
+                    process.stdout.readline()
+                )
+
+                if line:
+                    self._log(
+                        line.rstrip(
+                            "\r\n"
+                        )
+                    )
+
+                if (
+                    line == ""
+                    and process.poll()
+                    is not None
+                ):
+                    break
+
+                time.sleep(0.01)
+
+        finally:
+            if process.stdout is not None:
+                try:
+                    process.stdout.close()
+                except Exception:
+                    pass
+
+        exit_code = process.wait()
+
+        if exit_code != 0:
+            raise RuntimeError(
+                "rsync failed.\n\n"
+                f"Exit code: {exit_code}\n\n"
+                "Check the Maintenance Output above for "
+                "the rsync error message."
+            )
+
+        # ----------------------------------------------------
+        # STEP 4
+        # ----------------------------------------------------
+
+        self._log("")
+        self._log(
+            "Step 4/4: Verifying the local destination..."
+        )
+
+        if not destination_path.exists():
+            raise RuntimeError(
+                "The backup destination no longer exists:\n"
+                f"{destination_path}"
+            )
+
+        self._log(
+            f"Backup destination verified: "
+            f"{destination_path}"
+        )
+
+        self._log("")
+        self._log(
+            "Server Backup completed successfully."
+        )
+
+        return "backup"
 
     # ========================================================
     # SYSTEMD STATE
@@ -1483,6 +1844,9 @@ class MaintenanceOperation:
     # ========================================================
 
     def run(self):
+        if self.operation == "backup":
+            return self._backup()
+
         self._check_connection()
 
         if self.operation == "soft_wipe":
@@ -1510,6 +1874,7 @@ class MaintenancePanel(QWidget):
 
     Current operations:
 
+        - Server Backup
         - Soft Wipe
         - Full Wipe
 
@@ -1562,6 +1927,58 @@ class MaintenancePanel(QWidget):
 
     def _build_ui(self):
         main_layout = QVBoxLayout(self)
+
+        # ----------------------------------------------------
+        # BACKUP
+        # ----------------------------------------------------
+
+        backup_group = QGroupBox(
+            "Server Backup"
+        )
+
+        backup_layout = QVBoxLayout(
+            backup_group
+        )
+
+        backup_description = QLabel(
+            "Back up the complete DayZ server directory "
+            "to your PC using rsync over SSH. The SSH "
+            "connection and server path are taken directly "
+            "from Settings."
+        )
+
+        backup_description.setWordWrap(
+            True
+        )
+
+        backup_layout.addWidget(
+            backup_description
+        )
+
+        backup_buttons_layout = QHBoxLayout()
+
+        self.backup_button = QPushButton(
+            "Backup Server"
+        )
+
+        self.backup_button.setToolTip(
+            "Choose a local folder and copy the complete "
+            "configured DayZ server directory to it using rsync."
+        )
+
+        backup_buttons_layout.addWidget(
+            self.backup_button
+        )
+
+        backup_buttons_layout.addStretch()
+
+        backup_layout.addLayout(
+            backup_buttons_layout
+        )
+
+        main_layout.addWidget(
+            backup_group
+        )
 
         # ----------------------------------------------------
         # WIPES
@@ -1675,6 +2092,10 @@ class MaintenancePanel(QWidget):
         # SIGNALS
         # ----------------------------------------------------
 
+        self.backup_button.clicked.connect(
+            self.select_backup_destination
+        )
+
         self.soft_wipe_button.clicked.connect(
             self.confirm_soft_wipe
         )
@@ -1730,6 +2151,176 @@ class MaintenancePanel(QWidget):
 
     def clear_output(self):
         self.output.clear()
+
+    # ========================================================
+    # BACKUP
+    # ========================================================
+
+    def select_backup_destination(self):
+        """
+        Open a native folder chooser and start the backup
+        using the selected local directory.
+        """
+
+        if self.running:
+            return
+
+        if not self.ssh.is_connected():
+            QMessageBox.warning(
+                self,
+                "Not Connected",
+                "SSH connection is not active.",
+            )
+            return
+
+        # ----------------------------------------------------
+        # Validate the saved configuration before opening
+        # the folder chooser.
+        # ----------------------------------------------------
+
+        missing = []
+
+        if not str(
+            self.config.host
+            or ""
+        ).strip():
+            missing.append(
+                "SSH Host"
+            )
+
+        if not str(
+            self.config.username
+            or ""
+        ).strip():
+            missing.append(
+                "SSH Username"
+            )
+
+        if not str(
+            self.config.key_path
+            or ""
+        ).strip():
+            missing.append(
+                "SSH Private Key"
+            )
+
+        if not str(
+            self.config.server_root
+            or ""
+        ).strip():
+            missing.append(
+                "Server Root"
+            )
+
+        if missing:
+            QMessageBox.warning(
+                self,
+                "SSH Configuration Required",
+                (
+                    "The server backup cannot start because "
+                    "the following settings are missing:\n\n"
+                    + "\n".join(
+                        f"• {item}"
+                        for item in missing
+                    )
+                    + "\n\n"
+                    "Please open the Settings panel and "
+                    "configure them first."
+                ),
+            )
+            return
+
+        destination = QFileDialog.getExistingDirectory(
+            self,
+            "Choose Backup Destination",
+            str(
+                Path.home()
+            ),
+        )
+
+        if not destination:
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Confirm Server Backup",
+            (
+                "The complete configured DayZ server "
+                "directory will be copied to:\n\n"
+                f"{destination}\n\n"
+                "The backup uses rsync over your configured "
+                "SSH connection and may take some time "
+                "depending on the size of the server.\n\n"
+                "Continue?"
+            ),
+            QMessageBox.Yes
+            | QMessageBox.No,
+            QMessageBox.No,
+        )
+
+        if answer != QMessageBox.Yes:
+            return
+
+        self.start_backup(
+            destination
+        )
+
+    def start_backup(
+        self,
+        destination,
+    ):
+        if self.running:
+            return
+
+        if not self.ssh.is_connected():
+            QMessageBox.warning(
+                self,
+                "Not Connected",
+                "SSH connection is not active.",
+            )
+            return
+
+        destination = str(
+            destination or ""
+        ).strip()
+
+        if not destination:
+            return
+
+        self.clear_output()
+
+        self.running = True
+
+        self.status_label.setText(
+            "Running Server Backup..."
+        )
+
+        self._update_ui_state()
+
+        self._append_header(
+            "Server Backup"
+        )
+
+        operation_worker = (
+            MaintenanceOperation(
+                self.ssh,
+                self.config,
+                "backup",
+                backup_destination=destination,
+                sudo_password_getter=(
+                    self.sudo_password_getter
+                ),
+                log_callback=(
+                    self.log_bridge.message.emit
+                ),
+            )
+        )
+
+        self.jobs.start(
+            operation_worker.run,
+            on_ok=self._operation_finished,
+            on_fail=self._operation_failed,
+        )
 
     # ========================================================
     # CONFIRMATIONS
@@ -1901,7 +2492,9 @@ class MaintenancePanel(QWidget):
                 self.ssh,
                 self.config,
                 operation,
-                self.sudo_password_getter,
+                sudo_password_getter=(
+                    self.sudo_password_getter
+                ),
                 log_callback=(
                     self.log_bridge.message.emit
                 ),
@@ -1939,7 +2532,10 @@ class MaintenancePanel(QWidget):
         self,
         operation,
     ):
-        if operation == "soft_wipe":
+        if operation == "backup":
+            title = "Server Backup"
+
+        elif operation == "soft_wipe":
             title = "Soft Wipe"
 
         elif operation == "full_wipe":
@@ -2015,6 +2611,10 @@ class MaintenancePanel(QWidget):
         enabled = (
             connected
             and not self.running
+        )
+
+        self.backup_button.setEnabled(
+            enabled
         )
 
         self.soft_wipe_button.setEnabled(
