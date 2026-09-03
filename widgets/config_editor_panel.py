@@ -1398,6 +1398,7 @@ class ConfigSyntaxHighlighter(QSyntaxHighlighter):
         .cfg
         .txt
         .xml
+        .c
     """
 
     def __init__(
@@ -1489,6 +1490,102 @@ class ConfigSyntaxHighlighter(QSyntaxHighlighter):
 
         self.xml_declaration_format.setFontWeight(
             QFont.Weight.Bold
+        )
+
+        # ----------------------------------------------------------
+        # C syntax highlighting formats
+        # ----------------------------------------------------------
+
+        self.c_keyword_format = QTextCharFormat()
+        self.c_keyword_format.setForeground(
+            QColor("#569CD6")
+        )
+
+        self.c_keyword_format.setFontWeight(
+            QFont.Weight.Bold
+        )
+
+        self.c_type_format = QTextCharFormat()
+        self.c_type_format.setForeground(
+            QColor("#4EC9B0")
+        )
+
+        self.c_preprocessor_format = QTextCharFormat()
+        self.c_preprocessor_format.setForeground(
+            QColor("#C586C0")
+        )
+
+        self.c_function_format = QTextCharFormat()
+        self.c_function_format.setForeground(
+            QColor("#DCDCAA")
+        )
+
+        self.c_char_format = QTextCharFormat()
+        self.c_char_format.setForeground(
+            QColor("#D7BA7D")
+        )
+
+        self.c_number_format = QTextCharFormat()
+        self.c_number_format.setForeground(
+            QColor("#B5CEA8")
+        )
+
+        self.c_operator_format = QTextCharFormat()
+        self.c_operator_format.setForeground(
+            QColor("#D4D4D4")
+        )
+
+        self.c_keyword_pattern = re.compile(
+            r"\b(?:"
+            r"auto|break|case|const|continue|default|do|else|"
+            r"enum|extern|for|goto|if|inline|register|restrict|"
+            r"return|sizeof|static|struct|switch|typedef|union|"
+            r"volatile|while|_Alignas|_Alignof|_Atomic|_Bool|"
+            r"_Complex|_Generic|_Imaginary|_Noreturn|_Static_assert|"
+            r"_Thread_local"
+            r")\b"
+        )
+
+        self.c_type_pattern = re.compile(
+            r"\b(?:"
+            r"void|char|short|int|long|float|double|signed|"
+            r"unsigned|size_t|ptrdiff_t|FILE"
+            r")\b"
+        )
+
+        self.c_preprocessor_pattern = re.compile(
+            r"^\s*#\s*[A-Za-z_][A-Za-z0-9_]*"
+        )
+
+        self.c_function_pattern = re.compile(
+            r"\b[A-Za-z_][A-Za-z0-9_]*(?=\s*\()"
+        )
+
+        self.c_char_pattern = re.compile(
+            r"'(?:\\.|[^'\\])*'"
+        )
+
+        self.c_number_pattern = re.compile(
+            r"\b(?:"
+            r"0[xX][0-9A-Fa-f]+"
+            r"|0[bB][01]+"
+            r"|0[0-7]+"
+            r"|(?:\d+(?:\.\d*)?|\.\d+)"
+            r"(?:[eE][+-]?\d+)?"
+            r"[fFlL]?"
+            r")\b"
+        )
+
+        self.c_operator_pattern = re.compile(
+            r"->|"
+            r"\+\+|--|"
+            r"==|!=|<=|>=|"
+            r"&&|\|\||"
+            r"<<|>>|"
+            r"\+=|-=|\*=|/=|%=|"
+            r"&=|\|=|\^=|"
+            r"<<=|>>=|"
+            r"[+\-*/%=<>!&|^~?:]"
         )
 
         self.string_pattern = re.compile(
@@ -1590,6 +1687,11 @@ class ConfigSyntaxHighlighter(QSyntaxHighlighter):
 
         elif self.file_type == ".txt":
             self._highlight_txt(
+                text
+            )
+
+        elif self.file_type == ".c":
+            self._highlight_c(
                 text
             )
 
@@ -1815,6 +1917,491 @@ class ConfigSyntaxHighlighter(QSyntaxHighlighter):
                 match.start(),
                 match.end() - match.start(),
                 self.string_format,
+            )
+
+    # --------------------------------------------------------------
+    # C
+    # --------------------------------------------------------------
+
+    def _highlight_c(
+        self,
+        text,
+    ):
+        """
+        Highlight C source files.
+
+        Handles:
+            // single-line comments
+            /* multiline comments */
+            strings
+            character literals
+            preprocessor directives
+            keywords
+            built-in/common C types
+            function calls
+            numbers
+            operators
+        """
+
+        comment_ranges = []
+
+        # ----------------------------------------------------------
+        # Multiline C comments.
+        #
+        # State 1 means the previous block ended while inside
+        # a /* ... */ comment.
+        # ----------------------------------------------------------
+
+        code_ranges = []
+
+        if self.previousBlockState() == 1:
+            comment_end = text.find(
+                "*/"
+            )
+
+            if comment_end == -1:
+                self.setFormat(
+                    0,
+                    len(text),
+                    self.comment_format,
+                )
+
+                self.setCurrentBlockState(
+                    1
+                )
+
+                return
+
+            comment_end += 2
+
+            self.setFormat(
+                0,
+                comment_end,
+                self.comment_format,
+            )
+
+            comment_ranges.append(
+                (
+                    0,
+                    comment_end,
+                )
+            )
+
+            code_start = comment_end
+
+        else:
+            code_start = 0
+
+        self.setCurrentBlockState(
+            0
+        )
+
+        # ----------------------------------------------------------
+        # Find comments in the current line.
+        # ----------------------------------------------------------
+
+        search_position = code_start
+
+        while search_position < len(text):
+            line_comment_start = text.find(
+                "//",
+                search_position,
+            )
+
+            block_comment_start = text.find(
+                "/*",
+                search_position,
+            )
+
+            starts = [
+                position
+                for position in (
+                    line_comment_start,
+                    block_comment_start,
+                )
+                if position != -1
+            ]
+
+            if not starts:
+                break
+
+            comment_start = min(
+                starts
+            )
+
+            # ------------------------------------------------------
+            # Ignore comment markers inside strings/character
+            # literals.
+            # ------------------------------------------------------
+
+            in_string = False
+            in_char = False
+            escaped = False
+            real_comment_start = None
+
+            index = search_position
+
+            while index < len(text):
+                char = text[index]
+
+                if escaped:
+                    escaped = False
+                    index += 1
+                    continue
+
+                if (
+                    char == "\\"
+                    and (
+                        in_string
+                        or in_char
+                    )
+                ):
+                    escaped = True
+                    index += 1
+                    continue
+
+                if (
+                    not in_char
+                    and char == '"'
+                ):
+                    in_string = not in_string
+                    index += 1
+                    continue
+
+                if (
+                    not in_string
+                    and char == "'"
+                ):
+                    in_char = not in_char
+                    index += 1
+                    continue
+
+                if (
+                    not in_string
+                    and not in_char
+                    and (
+                        (
+                            char == "/"
+                            and index + 1 < len(text)
+                            and text[index + 1] == "/"
+                        )
+                        or (
+                            char == "/"
+                            and index + 1 < len(text)
+                            and text[index + 1] == "*"
+                        )
+                    )
+                ):
+                    real_comment_start = index
+                    break
+
+                index += 1
+
+            if real_comment_start is None:
+                break
+
+            if (
+                text.startswith(
+                    "//",
+                    real_comment_start,
+                )
+            ):
+                self.setFormat(
+                    real_comment_start,
+                    len(text) - real_comment_start,
+                    self.comment_format,
+                )
+
+                comment_ranges.append(
+                    (
+                        real_comment_start,
+                        len(text),
+                    )
+                )
+
+                break
+
+            # ------------------------------------------------------
+            # Block comment.
+            # ------------------------------------------------------
+
+            comment_end = text.find(
+                "*/",
+                real_comment_start + 2,
+            )
+
+            if comment_end == -1:
+                self.setFormat(
+                    real_comment_start,
+                    len(text) - real_comment_start,
+                    self.comment_format,
+                )
+
+                comment_ranges.append(
+                    (
+                        real_comment_start,
+                        len(text),
+                    )
+                )
+
+                self.setCurrentBlockState(
+                    1
+                )
+
+                break
+
+            comment_end += 2
+
+            self.setFormat(
+                real_comment_start,
+                comment_end - real_comment_start,
+                self.comment_format,
+            )
+
+            comment_ranges.append(
+                (
+                    real_comment_start,
+                    comment_end,
+                )
+            )
+
+            search_position = comment_end
+
+        # ----------------------------------------------------------
+        # Ranges that are safe for normal code highlighting.
+        # ----------------------------------------------------------
+
+        def overlaps_comment(
+            start,
+            end,
+        ):
+            return self._overlaps_any(
+                start,
+                end,
+                comment_ranges,
+            )
+
+        # ----------------------------------------------------------
+        # Preprocessor directive.
+        # ----------------------------------------------------------
+
+        preprocessor_match = (
+            self.c_preprocessor_pattern.match(
+                text
+            )
+        )
+
+        if preprocessor_match:
+            start = preprocessor_match.start()
+            end = preprocessor_match.end()
+
+            if not overlaps_comment(
+                start,
+                end,
+            ):
+                self.setFormat(
+                    start,
+                    end - start,
+                    self.c_preprocessor_format,
+                )
+
+        # ----------------------------------------------------------
+        # Strings.
+        # ----------------------------------------------------------
+
+        string_ranges = []
+
+        for match in self.string_pattern.finditer(
+            text
+        ):
+            if overlaps_comment(
+                match.start(),
+                match.end(),
+            ):
+                continue
+
+            self.setFormat(
+                match.start(),
+                match.end() - match.start(),
+                self.string_format,
+            )
+
+            string_ranges.append(
+                (
+                    match.start(),
+                    match.end(),
+                )
+            )
+
+        # ----------------------------------------------------------
+        # Character literals.
+        # ----------------------------------------------------------
+
+        char_ranges = []
+
+        for match in self.c_char_pattern.finditer(
+            text
+        ):
+            if overlaps_comment(
+                match.start(),
+                match.end(),
+            ):
+                continue
+
+            self.setFormat(
+                match.start(),
+                match.end() - match.start(),
+                self.c_char_format,
+            )
+
+            char_ranges.append(
+                (
+                    match.start(),
+                    match.end(),
+                )
+            )
+
+        # ----------------------------------------------------------
+        # Combine quoted ranges so keywords/numbers/operators
+        # aren't highlighted inside strings or character literals.
+        # ----------------------------------------------------------
+
+        quoted_ranges = (
+            string_ranges
+            + char_ranges
+        )
+
+        # ----------------------------------------------------------
+        # Keywords.
+        # ----------------------------------------------------------
+
+        for match in self.c_keyword_pattern.finditer(
+            text
+        ):
+            if overlaps_comment(
+                match.start(),
+                match.end(),
+            ):
+                continue
+
+            if self._overlaps_any(
+                match.start(),
+                match.end(),
+                quoted_ranges,
+            ):
+                continue
+
+            self.setFormat(
+                match.start(),
+                match.end() - match.start(),
+                self.c_keyword_format,
+            )
+
+        # ----------------------------------------------------------
+        # C types.
+        # ----------------------------------------------------------
+
+        for match in self.c_type_pattern.finditer(
+            text
+        ):
+            if overlaps_comment(
+                match.start(),
+                match.end(),
+            ):
+                continue
+
+            if self._overlaps_any(
+                match.start(),
+                match.end(),
+                quoted_ranges,
+            ):
+                continue
+
+            self.setFormat(
+                match.start(),
+                match.end() - match.start(),
+                self.c_type_format,
+            )
+
+        # ----------------------------------------------------------
+        # Function calls.
+        #
+        # Apply after keywords/types so common calls such as
+        # printf(), malloc(), etc. receive function highlighting.
+        # ----------------------------------------------------------
+
+        for match in self.c_function_pattern.finditer(
+            text
+        ):
+            if overlaps_comment(
+                match.start(),
+                match.end(),
+            ):
+                continue
+
+            if self._overlaps_any(
+                match.start(),
+                match.end(),
+                quoted_ranges,
+            ):
+                continue
+
+            self.setFormat(
+                match.start(),
+                match.end() - match.start(),
+                self.c_function_format,
+            )
+
+        # ----------------------------------------------------------
+        # Numbers.
+        # ----------------------------------------------------------
+
+        for match in self.c_number_pattern.finditer(
+            text
+        ):
+            if overlaps_comment(
+                match.start(),
+                match.end(),
+            ):
+                continue
+
+            if self._overlaps_any(
+                match.start(),
+                match.end(),
+                quoted_ranges,
+            ):
+                continue
+
+            self.setFormat(
+                match.start(),
+                match.end() - match.start(),
+                self.c_number_format,
+            )
+
+        # ----------------------------------------------------------
+        # Operators.
+        # ----------------------------------------------------------
+
+        for match in self.c_operator_pattern.finditer(
+            text
+        ):
+            if overlaps_comment(
+                match.start(),
+                match.end(),
+            ):
+                continue
+
+            if self._overlaps_any(
+                match.start(),
+                match.end(),
+                quoted_ranges,
+            ):
+                continue
+
+            self.setFormat(
+                match.start(),
+                match.end() - match.start(),
+                self.c_operator_format,
             )
 
     # --------------------------------------------------------------

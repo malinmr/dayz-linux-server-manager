@@ -640,6 +640,7 @@ class FilesPanel(QWidget):
         ".cfg",
         ".txt",
         ".xml",
+        ".c",
     }
 
     DEFAULT_COLUMN_WIDTHS = [
