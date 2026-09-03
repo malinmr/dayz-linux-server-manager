@@ -1,9 +1,10 @@
 import re
 import shlex
 import time
+import urllib.request
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPen
+from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -412,6 +413,10 @@ class ModsPanel(QWidget):
 
         self._connected = False
 
+        # Workshop preview state.
+        self._preview_request_id = 0
+        self._preview_pixmap = QPixmap()
+
         self.steamcmd_output.connect(
             self._append_log
         )
@@ -507,6 +512,110 @@ class ModsPanel(QWidget):
             search_group
         )
 
+        # The preview is deliberately placed on the LEFT while the
+        # original Workshop browser remains on the RIGHT and gets the
+        # majority of the available width.
+        search_body = QHBoxLayout()
+
+        # ----------------------------------------------------------
+        # Workshop Preview
+        # ----------------------------------------------------------
+
+        preview_group = QGroupBox(
+            "Workshop Preview"
+        )
+
+        preview_group.setMinimumWidth(
+            300
+        )
+
+        preview_group.setMaximumWidth(
+            360
+        )
+
+        preview_layout = QVBoxLayout(
+            preview_group
+        )
+
+        self.preview_title = QLabel(
+            "Select a Workshop item"
+        )
+
+        self.preview_title.setWordWrap(
+            True
+        )
+
+        self.preview_title.setAlignment(
+            Qt.AlignCenter
+        )
+
+        self.preview_title.setMinimumHeight(
+            42
+        )
+
+        preview_layout.addWidget(
+            self.preview_title
+        )
+
+        self.preview_image = QLabel(
+            "No preview available"
+        )
+
+        self.preview_image.setAlignment(
+            Qt.AlignCenter
+        )
+
+        self.preview_image.setMinimumSize(
+            260,
+            180,
+        )
+
+        self.preview_image.setStyleSheet(
+            "QLabel {"
+            " border: 1px solid palette(mid);"
+            " background: palette(base);"
+            "}"
+        )
+
+        preview_layout.addWidget(
+            self.preview_image,
+            1,
+        )
+
+        self.preview_info = QLabel(
+            ""
+        )
+
+        self.preview_info.setWordWrap(
+            True
+        )
+
+        self.preview_info.setAlignment(
+            Qt.AlignTop
+            | Qt.AlignLeft
+        )
+
+        preview_layout.addWidget(
+            self.preview_info
+        )
+
+        # ----------------------------------------------------------
+        # Original Workshop Browser
+        # ----------------------------------------------------------
+
+        browser_widget = QWidget()
+
+        browser_layout = QVBoxLayout(
+            browser_widget
+        )
+
+        browser_layout.setContentsMargins(
+            0,
+            0,
+            0,
+            0,
+        )
+
         search_row = QHBoxLayout()
 
         self.search_edit = QLineEdit()
@@ -535,7 +644,7 @@ class ModsPanel(QWidget):
             self.search_button
         )
 
-        search_layout.addLayout(
+        browser_layout.addLayout(
             search_row
         )
 
@@ -548,7 +657,7 @@ class ModsPanel(QWidget):
             [
                 "Title",
                 "Workshop ID",
-                "Subscribers",
+                "Uploader",
             ]
         )
 
@@ -569,7 +678,11 @@ class ModsPanel(QWidget):
             lambda _item: self.use_selected_workshop()
         )
 
-        search_layout.addWidget(
+        self.search_results.itemSelectionChanged.connect(
+            self._search_selection_changed
+        )
+
+        browser_layout.addWidget(
             self.search_results
         )
 
@@ -589,8 +702,24 @@ class ModsPanel(QWidget):
 
         use_row.addStretch()
 
-        search_layout.addLayout(
+        browser_layout.addLayout(
             use_row
+        )
+
+        # Preview gets a controlled width.
+        # Browser gets the remaining width.
+        search_body.addWidget(
+            preview_group,
+            0,
+        )
+
+        search_body.addWidget(
+            browser_widget,
+            1,
+        )
+
+        search_layout.addLayout(
+            search_body
         )
 
         root.addWidget(
@@ -903,6 +1032,343 @@ class ModsPanel(QWidget):
         )
 
     # ==============================================================
+    # Workshop Preview
+    # ==============================================================
+
+    def _search_selection_changed(self):
+        row = self.search_results.currentRow()
+
+        if row < 0:
+            self._clear_workshop_preview()
+            return
+
+        id_item = self.search_results.item(
+            row,
+            1,
+        )
+
+        title_item = self.search_results.item(
+            row,
+            0,
+        )
+
+        uploader_item = self.search_results.item(
+            row,
+            2,
+        )
+
+        if id_item is None:
+            self._clear_workshop_preview()
+            return
+
+        workshop_id = id_item.text().strip()
+
+        title = (
+            title_item.text().strip()
+            if title_item is not None
+            else ""
+        )
+
+        uploader = (
+            uploader_item.text().strip()
+            if uploader_item is not None
+            else ""
+        )
+
+        if not workshop_id:
+            self._clear_workshop_preview()
+            return
+
+        self._load_workshop_preview(
+            workshop_id,
+            title,
+            uploader,
+        )
+
+    def _clear_workshop_preview(self):
+        self._preview_request_id += 1
+
+        self._preview_pixmap = QPixmap()
+
+        self.preview_title.setText(
+            "Select a Workshop item"
+        )
+
+        self.preview_info.setText(
+            ""
+        )
+
+        self.preview_image.clear()
+
+        self.preview_image.setText(
+            "No preview available"
+        )
+
+    def _load_workshop_preview(
+        self,
+        workshop_id,
+        title="",
+        uploader="",
+    ):
+        api_key = (
+            self.config.steam_api_key.strip()
+        )
+
+        self._preview_request_id += 1
+
+        request_id = self._preview_request_id
+
+        self._preview_pixmap = QPixmap()
+
+        self.preview_title.setText(
+            title
+            or f"Workshop {workshop_id}"
+        )
+
+        self.preview_info.setText(
+            f"Workshop ID: {workshop_id}\n"
+            f"Uploader: {uploader or 'Unknown'}\n"
+            "Loading preview..."
+        )
+
+        self.preview_image.clear()
+
+        self.preview_image.setText(
+            "Loading preview..."
+        )
+
+        if not api_key:
+            self.preview_info.setText(
+                f"Workshop ID: {workshop_id}\n"
+                f"Uploader: {uploader or 'Unknown'}\n"
+                "Steam API key is not configured."
+            )
+
+            self.preview_image.setText(
+                "No Steam API key"
+            )
+
+            return
+
+        def task():
+            details = steam_web_api.get_details(
+                api_key,
+                workshop_id,
+            )
+
+            if not details:
+                raise RuntimeError(
+                    "Workshop item details were not returned."
+                )
+
+            preview_url = str(
+                details.get(
+                    "preview_url",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            details_title = str(
+                details.get(
+                    "title",
+                    "",
+                )
+                or title
+                or ""
+            ).strip()
+
+            details_uploader = (
+                str(
+                    details.get(
+                        "uploader",
+                        "",
+                    )
+                    or uploader
+                    or ""
+                ).strip()
+                or "Unknown"
+            )
+
+            subscriptions = details.get(
+                "subscriptions",
+                0,
+            )
+
+            if not preview_url:
+                return {
+                    "request_id": request_id,
+                    "workshop_id": workshop_id,
+                    "title": details_title,
+                    "uploader": details_uploader,
+                    "subscriptions": subscriptions,
+                    "image_data": b"",
+                    "preview_url": "",
+                }
+
+            request = urllib.request.Request(
+                preview_url,
+                headers={
+                    "User-Agent": (
+                        "DayZServerManager/1.0"
+                    ),
+                    "Accept": (
+                        "image/avif,image/webp,image/apng,"
+                        "image/svg+xml,image/*,*/*;q=0.8"
+                    ),
+                    "Referer": (
+                        "https://steamcommunity.com/"
+                    ),
+                },
+            )
+
+            with urllib.request.urlopen(
+                request,
+                timeout=15,
+            ) as response:
+                image_data = response.read()
+
+            return {
+                "request_id": request_id,
+                "workshop_id": workshop_id,
+                "title": details_title,
+                "uploader": details_uploader,
+                "subscriptions": subscriptions,
+                "image_data": image_data,
+                "preview_url": preview_url,
+            }
+
+        def success(result):
+            if request_id != self._preview_request_id:
+                return
+
+            result_title = str(
+                result.get(
+                    "title",
+                    "",
+                )
+                or title
+                or f"Workshop {workshop_id}"
+            )
+
+            result_uploader = (
+                str(
+                    result.get(
+                        "uploader",
+                        "",
+                    )
+                    or uploader
+                    or ""
+                ).strip()
+                or "Unknown"
+            )
+
+            subscriptions = result.get(
+                "subscriptions",
+                0,
+            )
+
+            self.preview_title.setText(
+                result_title
+            )
+
+            self.preview_info.setText(
+                f"Workshop ID: {workshop_id}\n"
+                f"Uploader: {result_uploader}\n"
+                f"Subscribers: {subscriptions}"
+            )
+
+            image_data = result.get(
+                "image_data",
+                b"",
+            )
+
+            if not image_data:
+                self.preview_image.clear()
+
+                self.preview_image.setText(
+                    "No preview image available"
+                )
+
+                return
+
+            pixmap = QPixmap()
+
+            if not pixmap.loadFromData(
+                image_data
+            ):
+                self.preview_image.clear()
+
+                self.preview_image.setText(
+                    "Preview image could not be loaded"
+                )
+
+                return
+
+            self._preview_pixmap = pixmap
+
+            self._display_preview_pixmap()
+
+        def failure(error):
+            if request_id != self._preview_request_id:
+                return
+
+            self.preview_info.setText(
+                f"Workshop ID: {workshop_id}\n"
+                f"Uploader: {uploader or 'Unknown'}\n"
+                "Preview could not be loaded."
+            )
+
+            self.preview_image.clear()
+
+            self.preview_image.setText(
+                "Preview unavailable"
+            )
+
+        self.jobs.start(
+            task,
+            on_ok=success,
+            on_fail=failure,
+        )
+
+    def _display_preview_pixmap(self):
+        if self._preview_pixmap.isNull():
+            return
+
+        width = max(
+            1,
+            self.preview_image.width() - 12,
+        )
+
+        height = max(
+            1,
+            self.preview_image.height() - 12,
+        )
+
+        scaled = self._preview_pixmap.scaled(
+            width,
+            height,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+
+        self.preview_image.setText(
+            ""
+        )
+
+        self.preview_image.setPixmap(
+            scaled
+        )
+
+    def resizeEvent(self, event):
+        super().resizeEvent(
+            event
+        )
+
+        if not self._preview_pixmap.isNull():
+            self._display_preview_pixmap()
+
+    # ==============================================================
     # Column persistence
     # ==============================================================
 
@@ -1104,8 +1570,25 @@ class ModsPanel(QWidget):
         self,
         results,
     ):
+        self._preview_request_id += 1
+        self._preview_pixmap = QPixmap()
+
         self.search_results.setRowCount(
             0
+        )
+
+        self.preview_title.setText(
+            "Select a Workshop item"
+        )
+
+        self.preview_info.setText(
+            ""
+        )
+
+        self.preview_image.clear()
+
+        self.preview_image.setText(
+            "No preview available"
         )
 
         if not results:
@@ -1143,11 +1626,14 @@ class ModsPanel(QWidget):
                 )
             )
 
-            subscriptions = str(
-                item.get(
-                    "subscriptions",
-                    0,
-                )
+            uploader = (
+                str(
+                    item.get(
+                        "uploader",
+                        "",
+                    )
+                ).strip()
+                or "Unknown"
             )
 
             self.search_results.setItem(
@@ -1170,7 +1656,7 @@ class ModsPanel(QWidget):
                 row,
                 2,
                 QTableWidgetItem(
-                    subscriptions
+                    uploader
                 ),
             )
 
