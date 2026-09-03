@@ -69,7 +69,7 @@ Modular design, lets you add panels if needed, handled in `main.py`. 101% AI slo
 Clone the repository:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/YOUR_PROJECT.git
+https://github.com/malinmr/dayz-linux-server-manager
 cd dayz-server-manager
 ```
 
