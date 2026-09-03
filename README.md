@@ -33,6 +33,7 @@ Modular design, lets you add panels if needed, handled in `main.py`. 101% AI slo
 * Basic editor for `.xml`, `.cfg`, `.txt` and `.json` files with syntax highlighting
 * Search function
 * Helper for DayZ-specific configuration errors (e.g. `min > nominal`)
+* Backup and restore configs
 
 ### Workshop Mods
 
@@ -49,6 +50,7 @@ Modular design, lets you add panels if needed, handled in `main.py`. 101% AI slo
 ### Maintenance
 
 * Soft/full wipe functions
+* Backup via rsync
 
 ### Deploy
 
