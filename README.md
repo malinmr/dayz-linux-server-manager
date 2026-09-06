@@ -30,7 +30,7 @@ Modular design, lets you add panels if needed, handled in `main.py`. 101% AI slo
 
 ### Config Editor
 
-* Basic editor for `.xml`, `.cfg`, `.txt` and `.json` files with syntax highlighting
+* Basic editor for `.xml`, `.cfg`, `.txt`, `.c` and `.json` files with syntax highlighting
 * Search function
 * Helper for DayZ-specific configuration errors (e.g. `min > nominal`)
 * Backup and restore configs
