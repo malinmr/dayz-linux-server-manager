@@ -19,6 +19,7 @@ from widgets.settings_panel import SettingsPanel
 from widgets.systemd_panel import SystemdPanel
 from widgets.rcon_panel import RConPanel
 from widgets.maintenance_panel import MaintenancePanel
+from widgets.map_panel import MapPanel
 
 
 class MainWindow(QMainWindow):
@@ -89,6 +90,25 @@ class MainWindow(QMainWindow):
         # Workshop Mods uses the same permanent SSH connection.
 
         self.mods_panel = ModsPanel(
+            self.ssh,
+            self.config,
+        )
+
+        # ====================================================
+        # MAP
+        # ====================================================
+        #
+        # The Map Panel uses the existing permanent SSH
+        # connection and the existing application configuration.
+        #
+        # Heatmap files are located remotely at:
+        #
+        #     <profiles_dir>/dzmanager
+        #
+        # MapPanel derives this path from AppConfig rather than
+        # hard-coding the server or profiles directory.
+
+        self.map_panel = MapPanel(
             self.ssh,
             self.config,
         )
@@ -270,6 +290,11 @@ class MainWindow(QMainWindow):
         )
 
         self.tabs.addTab(
+            self.map_panel,
+            "Map",
+        )
+
+        self.tabs.addTab(
             self.deploy_panel,
             "Deploy",
         )
@@ -299,6 +324,9 @@ class MainWindow(QMainWindow):
         #
         # MaintenancePanel IS included because it uses the shared
         # SSH connection.
+        #
+        # MapPanel IS included because it now uses the shared
+        # SSH connection to fetch heatmap data.
 
         self._connection_aware_panels = [
             self.log_viewer_panel,
@@ -308,6 +336,7 @@ class MainWindow(QMainWindow):
             self.deploy_panel,
             self.systemd_panel,
             self.maintenance_panel,
+            self.map_panel,
         ]
 
     # ========================================================
