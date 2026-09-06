@@ -52,11 +52,17 @@ Modular design, lets you add panels if needed, handled in `main.py`. 101% AI slo
 * Soft/full wipe functions
 * Backup via rsync
 
+### Map
+
+* Heatmap creation for chernarusplus and enoch
+
+
 ### Deploy
 
 * Deployment and update checks for SteamCMD
 * Deployment and update checks for stable/experimental DayZ server
 * Deployment and update checks for the systemd service file
+* Install a dedicated pbo file to the server for map, fps reading and more
 
 ### Settings
 
