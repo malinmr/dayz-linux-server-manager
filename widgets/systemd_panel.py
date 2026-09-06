@@ -44,6 +44,11 @@ class SystemdPanel(QWidget):
     The resolved path is exposed through profiles_path_changed so that
     MainWindow can keep FilesPanel synchronized without the panels
     directly knowing about each other.
+
+    The -limitFPS= parameter is also synchronized into the shared
+    application configuration as config.limit_fps so that the
+    StatusPanel can use the configured DayZ FPS limit as the 100%
+    graph reference.
     """
 
     profiles_path_changed = Signal(str)
@@ -99,6 +104,33 @@ class SystemdPanel(QWidget):
         self._update_profiles_path(
             emit_signal=False,
             save_config=False,
+        )
+
+        # --------------------------------------------------------------
+        # Restore configured FPS limit.
+        #
+        # This is shared with StatusPanel so the graph can use the
+        # actual -limitFPS value as its 100% reference.
+        # --------------------------------------------------------------
+
+        configured_limit_fps = getattr(
+            self.config,
+            "limit_fps",
+            0,
+        )
+
+        try:
+            configured_limit_fps = int(
+                configured_limit_fps
+            )
+        except (TypeError, ValueError):
+            configured_limit_fps = 0
+
+        if configured_limit_fps < 0:
+            configured_limit_fps = 0
+
+        self.limit_fps_param.setValue(
+            configured_limit_fps
         )
 
         # --------------------------------------------------------------
@@ -1637,6 +1669,12 @@ class SystemdPanel(QWidget):
             )
         )
 
+        # Keep the shared configuration synchronized with the value
+        # that is actually being saved to systemd.
+        self.config.limit_fps = (
+            self.limit_fps_param.value()
+        )
+
         self._append_output(
             f"Saving systemd unit: {path}"
         )
@@ -1722,6 +1760,11 @@ class SystemdPanel(QWidget):
 
             self.config.log_dir = (
                 resolved_profiles_path
+            )
+
+            # Persist the configured DayZ FPS limit too.
+            self.config.limit_fps = (
+                self.limit_fps_param.value()
             )
 
             self.config.save()
@@ -1983,9 +2026,18 @@ class SystemdPanel(QWidget):
             parsed.get("cpuCount"),
         )
 
+        # --------------------------------------------------------------
+        # Read the real -limitFPS value from ExecStart and synchronize
+        # it into shared AppConfig.
+        # --------------------------------------------------------------
+
         self._set_spinbox_optional(
             self.limit_fps_param,
             parsed.get("limitFPS"),
+        )
+
+        self.config.limit_fps = (
+            self.limit_fps_param.value()
         )
 
         self.mod_param.setPlainText(
@@ -2033,6 +2085,11 @@ class SystemdPanel(QWidget):
         self._append_output(
             "Resolved Profiles directory: "
             + self.config.profiles_dir
+        )
+
+        self._append_output(
+            "Configured DayZ FPS limit: "
+            + str(self.config.limit_fps)
         )
 
     # ------------------------------------------------------------------
@@ -2296,6 +2353,13 @@ class SystemdPanel(QWidget):
             profiles_value=profiles_value,
         )
 
+        # Keep shared config synchronized immediately.
+        # This means StatusPanel sees the new graph reference
+        # as soon as the parameter is applied.
+        self.config.limit_fps = (
+            self.limit_fps_param.value()
+        )
+
         self._append_output(
             "Parameters applied to ExecStart. "
             "Review the unit above before saving."
@@ -2304,6 +2368,11 @@ class SystemdPanel(QWidget):
         self._append_output(
             "Resolved Profiles directory: "
             + self.config.profiles_dir
+        )
+
+        self._append_output(
+            "Configured DayZ FPS limit: "
+            + str(self.config.limit_fps)
         )
 
     # ------------------------------------------------------------------

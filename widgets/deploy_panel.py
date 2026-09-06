@@ -2,6 +2,8 @@ import re
 import shlex
 import time
 
+from pathlib import Path
+
 from PySide6.QtCore import Qt, Signal
 
 from PySide6.QtWidgets import (
@@ -23,6 +25,19 @@ from worker import WorkerRegistry
 
 APPID_STABLE = "223350"
 APPID_EXPERIMENTAL = "1042420"
+
+# dzmanager.pbo is shipped alongside this application (not downloaded
+# from Steam) and is copied to the remote server's addons directory
+# over SFTP. This file lives in <project_root>/widgets/, and the pbo
+# ships in <project_root>/pbo/, hence the parent.parent.
+LOCAL_PBO_DIR = Path(__file__).resolve().parent.parent / "pbo"
+
+DZMANAGER_PBO_FILENAME = "dzmanager.pbo"
+
+# Directory name under the DayZ server install dir that dzmanager.pbo
+# is deployed to/removed from. Already present on any deployed DayZ
+# server, so this is never created here.
+REMOTE_ADDON_SUBDIR = "addons"
 
 STEAMCMD_DOWNLOAD_URL = (
     "https://steamcdn-a.akamaihd.net/client/installer/"
@@ -169,6 +184,11 @@ class DeployPanel(QWidget):
         self.jobs = WorkerRegistry()
 
         self.detected_steamcmd = None
+
+        # Whether dzmanager.pbo is currently known to be present in
+        # the server's addons directory. Kept up to date by
+        # check_status() and by deploy/uninstall completing.
+        self._pbo_deployed = False
 
         self._full_credential_result = None
 
@@ -595,6 +615,28 @@ class DeployPanel(QWidget):
             self.deploy_systemd_btn
         )
 
+        # ----------------------------------------------------
+        # Deploy dzmanager.pbo
+        # ----------------------------------------------------
+
+        self.deploy_pbo_btn = QPushButton(
+            "Deploy dzmanager.pbo"
+        )
+
+        self.deploy_pbo_btn.setToolTip(
+            "Deploys tools/pbo/dzmanager.pbo to the server's "
+            "addons directory. Once deployed, this button "
+            "switches to removing it instead."
+        )
+
+        self.deploy_pbo_btn.clicked.connect(
+            self.deploy_dzmanager_pbo
+        )
+
+        systemd_row.addWidget(
+            self.deploy_pbo_btn
+        )
+
         systemd_row.addStretch()
 
         layout.addLayout(
@@ -692,6 +734,7 @@ class DeployPanel(QWidget):
             self.install_stable_btn,
             self.install_experimental_btn,
             self.deploy_systemd_btn,
+            self.deploy_pbo_btn,
             self.apply_btn,
         ):
             widget.setEnabled(
@@ -737,6 +780,10 @@ class DeployPanel(QWidget):
             )
 
             self._reset_systemd_status()
+
+            self._set_pbo_button_state(
+                False
+            )
 
     # ========================================================
     # CONFIG REFRESH
@@ -788,6 +835,7 @@ class DeployPanel(QWidget):
             self.install_stable_btn,
             self.install_experimental_btn,
             self.deploy_systemd_btn,
+            self.deploy_pbo_btn,
             self.apply_btn,
         ):
             widget.setEnabled(
@@ -1636,11 +1684,38 @@ class DeployPanel(QWidget):
 
             systemd = self._check_systemd_service()
 
+            _, pbo_remote_path = (
+                self._remote_addon_paths(
+                    server_root
+                )
+            )
+
+            try:
+                pbo_deployed = (
+                    self._check_pbo_deployed(
+                        pbo_remote_path
+                    )
+                )
+
+                pbo_check_error = None
+
+            except Exception as exc:
+                # Could not confirm either way (dropped connection,
+                # permissions, missing addons dir, etc.) -- this is
+                # NOT the same as confirming the file is gone, so we
+                # deliberately do not default pbo_deployed to False
+                # here. The caller keeps whatever state it last knew.
+                pbo_deployed = None
+
+                pbo_check_error = str(exc)
+
             return {
                 "steamcmd": detected,
                 "stable": stable,
                 "experimental": experimental,
                 "systemd": systemd,
+                "pbo_deployed": pbo_deployed,
+                "pbo_check_error": pbo_check_error,
             }
 
         def fail(error):
@@ -1740,7 +1815,24 @@ class DeployPanel(QWidget):
         experimental = result["experimental"]
         systemd = result["systemd"]
 
-        self.detected_steamcmd = detected
+        pbo_deployed = result.get(
+            "pbo_deployed"
+        )
+
+        if pbo_deployed is None:
+            self._append(
+                "dzmanager.pbo status could not be "
+                "confirmed, leaving button as-is: "
+                + (
+                    result.get("pbo_check_error")
+                    or "unknown error"
+                )
+            )
+
+        else:
+            self._set_pbo_button_state(
+                pbo_deployed
+            )
 
         if detected:
             self.steamcmd_status.setText(
@@ -3505,6 +3597,261 @@ class DeployPanel(QWidget):
             QMessageBox.critical(
                 self,
                 "Systemd Deployment Failed",
+                str(error),
+            )
+
+        self.jobs.start(
+            task,
+            on_ok=ok,
+            on_fail=fail,
+        )
+
+    # ========================================================
+    # DEPLOY / UNINSTALL DZMANAGER.PBO
+    # ========================================================
+
+    def _set_pbo_button_state(self, deployed):
+        self._pbo_deployed = bool(
+            deployed
+        )
+
+        self.deploy_pbo_btn.setText(
+            "Uninstall dzmanager.pbo"
+            if self._pbo_deployed
+            else "Deploy dzmanager.pbo"
+        )
+
+    def _check_pbo_deployed(self, remote_path):
+        """
+        Return True if dzmanager.pbo is confirmed present at
+        remote_path, False if confirmed absent. Meant to be called
+        from a background thread. Any other failure (dropped
+        connection, permissions, missing addons dir, etc.) is NOT
+        caught here -- it propagates so the caller can tell "confirmed
+        absent" apart from "couldn't check" instead of assuming
+        the file is gone.
+        """
+
+        sftp = self.ssh.sftp()
+
+        try:
+            try:
+                sftp.stat(remote_path)
+
+                return True
+
+            except FileNotFoundError:
+                return False
+
+        finally:
+            sftp.close()
+
+    def _remote_addon_paths(self, server_root):
+        remote_dir = (
+            server_root.rstrip("/")
+            + "/"
+            + REMOTE_ADDON_SUBDIR
+        )
+
+        remote_path = (
+            remote_dir
+            + "/"
+            + DZMANAGER_PBO_FILENAME
+        )
+
+        return remote_dir, remote_path
+
+    def deploy_dzmanager_pbo(self):
+        if not self._require_connected():
+            return
+
+        server_root = (
+            self.server_root_edit.text().strip()
+        )
+
+        if not server_root:
+            QMessageBox.warning(
+                self,
+                "Missing server directory",
+                "Enter the DayZ server installation directory first.",
+            )
+
+            return
+
+        remote_dir, remote_path = (
+            self._remote_addon_paths(server_root)
+        )
+
+        if self._pbo_deployed:
+            self._uninstall_dzmanager_pbo(
+                remote_path
+            )
+
+            return
+
+        local_path = (
+            LOCAL_PBO_DIR
+            / DZMANAGER_PBO_FILENAME
+        )
+
+        if not local_path.is_file():
+            QMessageBox.critical(
+                self,
+                "dzmanager.pbo Not Found",
+                (
+                    "Could not find dzmanager.pbo locally:\n\n"
+                    f"{local_path}"
+                ),
+            )
+
+            return
+
+        self._append(
+            "--- Deploying dzmanager.pbo ---"
+        )
+
+        self._append(
+            f"Local:  {local_path}"
+        )
+
+        self._append(
+            f"Remote: {remote_path}"
+        )
+
+        self._set_busy(True)
+
+        def task():
+            sftp = self.ssh.sftp()
+
+            try:
+                try:
+                    sftp.stat(remote_dir)
+
+                except FileNotFoundError:
+                    raise RuntimeError(
+                        "Remote addons directory not found:\n"
+                        f"{remote_dir}\n\n"
+                        "Is the DayZ server deployed at this "
+                        "install directory?"
+                    )
+
+                sftp.put(
+                    str(local_path),
+                    remote_path,
+                )
+
+            finally:
+                sftp.close()
+
+            return remote_path
+
+        def ok(result):
+            self._set_busy(False)
+
+            self._set_pbo_button_state(
+                True
+            )
+
+            self._append(
+                f"dzmanager.pbo deployed to: {result}"
+            )
+
+            QMessageBox.information(
+                self,
+                "dzmanager.pbo Deployed",
+                f"Deployed:\n{result}",
+            )
+
+        def fail(error):
+            self._set_busy(False)
+
+            self._append(
+                f"dzmanager.pbo deployment failed: {error}"
+            )
+
+            QMessageBox.critical(
+                self,
+                "Deployment Failed",
+                str(error),
+            )
+
+        self.jobs.start(
+            task,
+            on_ok=ok,
+            on_fail=fail,
+        )
+
+    def _uninstall_dzmanager_pbo(self, remote_path):
+        self._append(
+            "--- Uninstalling dzmanager.pbo ---"
+        )
+
+        self._append(
+            f"Removing: {remote_path}"
+        )
+
+        self._set_busy(True)
+
+        def task():
+            return self.ssh.exec(
+                "rm -f "
+                + shlex.quote(remote_path)
+            )
+
+        def ok(result):
+            code, output, error = result
+
+            self._set_busy(False)
+
+            if output:
+                self._append(
+                    output.strip()
+                )
+
+            if error:
+                self._append(
+                    error.strip()
+                )
+
+            if code != 0:
+                self._append(
+                    "Failed to remove dzmanager.pbo."
+                )
+
+                QMessageBox.critical(
+                    self,
+                    "Uninstall Failed",
+                    error
+                    or output
+                    or "Unknown error.",
+                )
+
+                return
+
+            self._set_pbo_button_state(
+                False
+            )
+
+            self._append(
+                "dzmanager.pbo removed."
+            )
+
+            QMessageBox.information(
+                self,
+                "dzmanager.pbo Removed",
+                f"Removed:\n{remote_path}",
+            )
+
+        def fail(error):
+            self._set_busy(False)
+
+            self._append(
+                f"dzmanager.pbo uninstall failed: {error}"
+            )
+
+            QMessageBox.critical(
+                self,
+                "Uninstall Failed",
                 str(error),
             )
 

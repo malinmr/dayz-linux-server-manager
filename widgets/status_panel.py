@@ -188,14 +188,19 @@ class LiveHistoryGraph(QWidget):
     """
     Qt-native live history graph.
 
-    The graph displays four metrics on a shared 0-100 scale:
+    Players, CPU and RAM use the normal 0-100% graph scale.
 
-        Players = percentage of max player slots
-        CPU     = process CPU relative to total CPU capacity
-        RAM     = system memory percentage
-        FPS     = relative to 60 FPS
+    FPS is read from the DayZ FPSLogger CSV and is normalized against
+    the configured DayZ -limitFPS value:
 
-    The original/raw values are retained for the hover tooltip.
+        FPS percentage = actual FPS / configured limitFPS * 100
+
+    The raw FPS value is always retained.
+
+    FPS samples are stored separately from Players/CPU/RAM samples
+    because the FPS CSV produces measurements on its own 10-second
+    schedule. This prevents an FPS sample and a normal resource sample
+    from becoming artificially tied to the same graph point.
     """
 
     PLAYER_COLOR = QColor("#4FC3F7")
@@ -206,9 +211,17 @@ class LiveHistoryGraph(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
 
+        # Players / CPU / RAM samples.
         self.samples = deque(maxlen=3600)
 
+        # FPSLogger samples are kept separately because they have their
+        # own timestamps and arrive independently of the GUI polling.
+        self.fps_samples = deque(maxlen=3600)
+
         self.window_minutes = 5
+
+        # 0 means -limitFPS is not configured.
+        self.fps_limit = 0
 
         self.setMinimumHeight(190)
 
@@ -219,18 +232,43 @@ class LiveHistoryGraph(QWidget):
 
         self.setMouseTracking(True)
 
-    # ----------------------------------------------------------------
-    # History management
-    # ----------------------------------------------------------------
-
     def clear_history(self):
         self.samples.clear()
+        self.fps_samples.clear()
         self.update()
 
     def set_time_window(self, minutes):
         self.window_minutes = int(minutes)
 
         self._trim_samples()
+
+        self.update()
+
+    def set_fps_limit(self, limit_fps):
+        """
+        Set the configured DayZ -limitFPS value.
+
+        0 means no -limitFPS parameter is configured.
+
+        FPS is intentionally NOT permanently normalized here. The raw
+        FPS value remains in fps_samples and is normalized while
+        drawing. This means changing the configured limit immediately
+        changes the graph without modifying the stored measurements.
+        """
+
+        try:
+            limit_fps = int(limit_fps)
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            limit_fps = 0
+
+        if limit_fps < 0:
+            limit_fps = 0
+
+        self.fps_limit = limit_fps
 
         self.update()
 
@@ -244,6 +282,81 @@ class LiveHistoryGraph(QWidget):
         ram_percent=None,
         fps=None,
     ):
+        """
+        Add a graph sample.
+
+        FPS-only samples go into fps_samples.
+
+        Players/CPU/RAM samples go into samples.
+
+        This is important because the DayZ FPSLogger and the GUI
+        resource polling do not produce measurements at the same time.
+        """
+
+        timestamp = float(timestamp)
+
+        # ------------------------------------------------------------
+        # FPS sample
+        # ------------------------------------------------------------
+
+        if fps is not None:
+            try:
+                fps_value = float(fps)
+
+                if fps_value < 0:
+                    fps_value = None
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+                fps_value = None
+
+            if fps_value is not None:
+                # Avoid inserting the exact same FPS measurement twice.
+                duplicate = False
+
+                if self.fps_samples:
+                    last_fps_sample = (
+                        self.fps_samples[-1]
+                    )
+
+                    duplicate = (
+                        last_fps_sample.get("timestamp")
+                        == timestamp
+                        and last_fps_sample.get("fps")
+                        == fps_value
+                    )
+
+                if not duplicate:
+                    self.fps_samples.append(
+                        {
+                            "timestamp": timestamp,
+                            "fps": fps_value,
+                        }
+                    )
+
+                self._trim_samples()
+                self.update()
+
+        # ------------------------------------------------------------
+        # Players / CPU / RAM sample
+        # ------------------------------------------------------------
+
+        has_resource_data = any(
+            value is not None
+            for value in (
+                players,
+                max_players,
+                cpu_percent,
+                cpu_count,
+                ram_percent,
+            )
+        )
+
+        if not has_resource_data:
+            return
+
         player_value = None
 
         if (
@@ -268,82 +381,78 @@ class LiveHistoryGraph(QWidget):
         cpu_value = None
 
         if cpu_percent is not None:
-            cores = float(
-                cpu_count or 1
-            )
+            try:
+                cores = float(cpu_count or 1)
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+                cores = 1.0
 
             if cores <= 0:
                 cores = 1.0
 
-            cpu_value = (
-                float(cpu_percent)
-                / cores
-            )
+            try:
+                cpu_value = (
+                    float(cpu_percent)
+                    / cores
+                )
 
-            cpu_value = max(
-                0.0,
-                min(
-                    100.0,
-                    cpu_value,
-                ),
-            )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                cpu_value = None
+
+            if cpu_value is not None:
+                cpu_value = max(
+                    0.0,
+                    min(
+                        100.0,
+                        cpu_value,
+                    ),
+                )
 
         ram_value = None
 
         if ram_percent is not None:
-            ram_value = max(
-                0.0,
-                min(
-                    100.0,
-                    float(ram_percent),
-                ),
-            )
+            try:
+                ram_value = float(ram_percent)
 
-        fps_value = None
+            except (
+                TypeError,
+                ValueError,
+            ):
+                ram_value = None
 
-        if fps is not None:
-            fps_value = (
-                float(fps)
-                / 60.0
-                * 100.0
-            )
-
-            fps_value = max(
-                0.0,
-                min(
-                    100.0,
-                    fps_value,
-                ),
-            )
+            if ram_value is not None:
+                ram_value = max(
+                    0.0,
+                    min(
+                        100.0,
+                        ram_value,
+                    ),
+                )
 
         self.samples.append(
             {
-                "timestamp": float(timestamp),
-
+                "timestamp": timestamp,
                 "players": players,
                 "max_players": max_players,
                 "player_value": player_value,
-
                 "cpu": cpu_percent,
                 "cpu_count": cpu_count,
                 "cpu_value": cpu_value,
-
                 "ram": ram_percent,
                 "ram_value": ram_value,
-
-                "fps": fps,
-                "fps_value": fps_value,
             }
         )
 
         self._trim_samples()
-
         self.update()
 
     def _trim_samples(self):
-        if not self.samples:
-            return
-
         cutoff = (
             time.time()
             - self.window_minutes * 60
@@ -355,24 +464,28 @@ class LiveHistoryGraph(QWidget):
         ):
             self.samples.popleft()
 
-    # ----------------------------------------------------------------
-    # Painting
-    # ----------------------------------------------------------------
+        while (
+            self.fps_samples
+            and self.fps_samples[0]["timestamp"] < cutoff
+        ):
+            self.fps_samples.popleft()
 
     def _plot_rect(self):
         return self.rect().adjusted(
             48,
             34,
-            -12,
+            -10,
             -30,
         )
 
     def _series_points(
         self,
+        samples,
         key,
         plot,
+        value_max=100.0,
     ):
-        if not self.samples:
+        if not samples:
             return []
 
         first_time = (
@@ -389,10 +502,25 @@ class LiveHistoryGraph(QWidget):
 
         points = []
 
-        for sample in self.samples:
+        for sample in samples:
             value = sample.get(key)
 
             if value is None:
+                if (
+                    points
+                    and points[-1] is not None
+                ):
+                    points.append(None)
+
+                continue
+
+            try:
+                numeric_value = float(value)
+
+            except (
+                TypeError,
+                ValueError,
+            ):
                 if (
                     points
                     and points[-1] is not None
@@ -421,12 +549,152 @@ class LiveHistoryGraph(QWidget):
                 ),
             )
 
+            normalized = (
+                numeric_value
+                / float(value_max)
+            )
+
+            normalized = max(
+                0.0,
+                min(
+                    1.0,
+                    normalized,
+                ),
+            )
+
             y = (
                 plot.bottom()
-                - (
-                    float(value)
-                    / 100.0
+                - normalized
+                * plot.height()
+            )
+
+            y = max(
+                plot.top(),
+                min(
+                    plot.bottom(),
+                    y,
+                ),
+            )
+
+            points.append(
+                (
+                    int(x),
+                    int(y),
                 )
+            )
+
+        return points
+
+    def _fps_series_points(self, plot):
+        """
+        Convert raw FPS samples to graph coordinates.
+
+        100% is ALWAYS the configured -limitFPS value.
+
+        Example:
+
+            limitFPS = 200
+            actual FPS = 100
+            graph = 50%
+
+        If no limitFPS is configured, there is no authoritative 100%
+        reference, so the FPS line is not plotted.
+        """
+
+        if (
+            not self.fps_samples
+            or self.fps_limit <= 0
+        ):
+            return []
+
+        first_time = (
+            time.time()
+            - self.window_minutes * 60
+        )
+
+        last_time = time.time()
+
+        time_span = max(
+            1.0,
+            last_time - first_time,
+        )
+
+        points = []
+
+        for sample in self.fps_samples:
+            fps = sample.get("fps")
+
+            if fps is None:
+                if (
+                    points
+                    and points[-1] is not None
+                ):
+                    points.append(None)
+
+                continue
+
+            try:
+                fps = float(fps)
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+                if (
+                    points
+                    and points[-1] is not None
+                ):
+                    points.append(None)
+
+                continue
+
+            if fps < 0:
+                if (
+                    points
+                    and points[-1] is not None
+                ):
+                    points.append(None)
+
+                continue
+
+            x = (
+                plot.left()
+                + (
+                    (
+                        sample["timestamp"]
+                        - first_time
+                    )
+                    / time_span
+                )
+                * plot.width()
+            )
+
+            x = max(
+                plot.left(),
+                min(
+                    plot.right(),
+                    x,
+                ),
+            )
+
+            # IMPORTANT:
+            # The actual systemd -limitFPS value is the 100% reference.
+            normalized = (
+                fps
+                / float(self.fps_limit)
+            )
+
+            normalized = max(
+                0.0,
+                min(
+                    1.0,
+                    normalized,
+                ),
+            )
+
+            y = (
+                plot.bottom()
+                - normalized
                 * plot.height()
             )
 
@@ -450,15 +718,9 @@ class LiveHistoryGraph(QWidget):
     def _draw_series(
         self,
         painter,
-        plot,
-        key,
+        points,
         color,
     ):
-        points = self._series_points(
-            key,
-            plot,
-        )
-
         if not points:
             return
 
@@ -486,22 +748,10 @@ class LiveHistoryGraph(QWidget):
 
     def _draw_legend(self, painter):
         entries = (
-            (
-                "Players",
-                self.PLAYER_COLOR,
-            ),
-            (
-                "CPU",
-                self.CPU_COLOR,
-            ),
-            (
-                "RAM",
-                self.RAM_COLOR,
-            ),
-            (
-                "FPS",
-                self.FPS_COLOR,
-            ),
+            ("Players", self.PLAYER_COLOR),
+            ("CPU", self.CPU_COLOR),
+            ("RAM", self.RAM_COLOR),
+            ("FPS", self.FPS_COLOR),
         )
 
         x = 52
@@ -509,7 +759,6 @@ class LiveHistoryGraph(QWidget):
 
         font = painter.font()
         font.setPointSize(8)
-
         painter.setFont(font)
 
         metrics = painter.fontMetrics()
@@ -533,9 +782,7 @@ class LiveHistoryGraph(QWidget):
                 y - 3,
             )
 
-            painter.setPen(
-                text_color
-            )
+            painter.setPen(text_color)
 
             painter.drawText(
                 x + 19,
@@ -544,9 +791,7 @@ class LiveHistoryGraph(QWidget):
             )
 
             x += (
-                metrics.horizontalAdvance(
-                    name
-                )
+                metrics.horizontalAdvance(name)
                 + 45
             )
 
@@ -584,25 +829,15 @@ class LiveHistoryGraph(QWidget):
         ):
             return
 
-        self._draw_legend(
-            painter
-        )
+        self._draw_legend(painter)
 
-        grid_color = QColor(
-            text_color
-        )
-
+        grid_color = QColor(text_color)
         grid_color.setAlpha(45)
 
-        grid_pen = QPen(
-            grid_color
-        )
-
+        grid_pen = QPen(grid_color)
         grid_pen.setWidth(1)
 
-        painter.setPen(
-            grid_pen
-        )
+        painter.setPen(grid_pen)
 
         for percent in (
             0,
@@ -629,9 +864,7 @@ class LiveHistoryGraph(QWidget):
                 int(y),
             )
 
-            painter.setPen(
-                text_color
-            )
+            painter.setPen(text_color)
 
             painter.drawText(
                 5,
@@ -639,13 +872,9 @@ class LiveHistoryGraph(QWidget):
                 str(percent),
             )
 
-            painter.setPen(
-                grid_pen
-            )
+            painter.setPen(grid_pen)
 
-        painter.setPen(
-            text_color
-        )
+        painter.setPen(text_color)
 
         painter.drawText(
             plot.left(),
@@ -657,9 +886,7 @@ class LiveHistoryGraph(QWidget):
 
         now_width = (
             painter.fontMetrics()
-            .horizontalAdvance(
-                now_text
-            )
+            .horizontalAdvance(now_text)
         )
 
         painter.drawText(
@@ -668,40 +895,80 @@ class LiveHistoryGraph(QWidget):
             now_text,
         )
 
+        # Players
+        player_points = self._series_points(
+            self.samples,
+            "player_value",
+            plot,
+            100.0,
+        )
+
         self._draw_series(
             painter,
-            plot,
-            "player_value",
+            player_points,
             self.PLAYER_COLOR,
         )
 
+        # CPU
+        cpu_points = self._series_points(
+            self.samples,
+            "cpu_value",
+            plot,
+            100.0,
+        )
+
         self._draw_series(
             painter,
-            plot,
-            "cpu_value",
+            cpu_points,
             self.CPU_COLOR,
         )
 
+        # RAM
+        ram_points = self._series_points(
+            self.samples,
+            "ram_value",
+            plot,
+            100.0,
+        )
+
         self._draw_series(
             painter,
-            plot,
-            "ram_value",
+            ram_points,
             self.RAM_COLOR,
         )
 
+        # FPS
+        fps_points = self._fps_series_points(
+            plot
+        )
+
         self._draw_series(
             painter,
-            plot,
-            "fps_value",
+            fps_points,
             self.FPS_COLOR,
         )
 
-    # ----------------------------------------------------------------
-    # Hover information.
-    # ----------------------------------------------------------------
+    def _nearest_sample(
+        self,
+        samples,
+        target_time,
+    ):
+        if not samples:
+            return None
+
+        return min(
+            samples,
+            key=lambda item: abs(
+                item["timestamp"]
+                - target_time
+            ),
+        )
 
     def mouseMoveEvent(self, event):
-        if not self.samples:
+        if (
+            not self.samples
+            and not self.fps_samples
+        ):
             QToolTip.hideText()
             return
 
@@ -729,84 +996,142 @@ class LiveHistoryGraph(QWidget):
             * 60
         )
 
-        sample = min(
+        resource_sample = self._nearest_sample(
             self.samples,
-            key=lambda item: abs(
-                item["timestamp"]
-                - target_time
-            ),
+            target_time,
         )
 
-        timestamp = time.strftime(
-            "%H:%M:%S",
-            time.localtime(
-                sample["timestamp"]
-            ),
+        fps_sample = self._nearest_sample(
+            self.fps_samples,
+            target_time,
         )
 
-        lines = [
-            timestamp
-        ]
+        lines = []
 
-        players = sample.get(
-            "players"
-        )
+        if resource_sample is not None:
+            timestamp = time.strftime(
+                "%H:%M:%S",
+                time.localtime(
+                    resource_sample["timestamp"]
+                ),
+            )
 
-        max_players = sample.get(
-            "max_players"
-        )
+            lines.append(timestamp)
 
-        if players is not None:
-            if max_players is not None:
+            players = resource_sample.get(
+                "players"
+            )
+
+            max_players = resource_sample.get(
+                "max_players"
+            )
+
+            if players is not None:
+                if max_players is not None:
+                    lines.append(
+                        f"Players: {players}/{max_players}"
+                    )
+                else:
+                    lines.append(
+                        f"Players: {players}"
+                    )
+
+            cpu = resource_sample.get(
+                "cpu"
+            )
+
+            if cpu is not None:
+                cpu_count = (
+                    resource_sample.get(
+                        "cpu_count"
+                    )
+                    or 1
+                )
+
+                try:
+                    normalized_cpu = (
+                        float(cpu)
+                        / float(cpu_count)
+                    )
+
+                    lines.append(
+                        f"CPU: {float(cpu):.1f}% "
+                        f"process "
+                        f"({normalized_cpu:.1f}% total)"
+                    )
+
+                except (
+                    TypeError,
+                    ValueError,
+                    ZeroDivisionError,
+                ):
+                    lines.append(
+                        f"CPU: {cpu}"
+                    )
+
+            ram = resource_sample.get(
+                "ram"
+            )
+
+            if ram is not None:
+                try:
+                    lines.append(
+                        f"RAM: {float(ram):.1f}%"
+                    )
+
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+                    lines.append(
+                        f"RAM: {ram}"
+                    )
+
+        if fps_sample is not None:
+            fps_timestamp = time.strftime(
+                "%H:%M:%S",
+                time.localtime(
+                    fps_sample["timestamp"]
+                ),
+            )
+
+            if not lines:
                 lines.append(
-                    f"Players: "
-                    f"{players}/{max_players}"
+                    fps_timestamp
                 )
-            else:
+
+            fps = fps_sample.get(
+                "fps"
+            )
+
+            if fps is not None:
                 lines.append(
-                    f"Players: {players}"
+                    f"FPS: {float(fps):.1f}"
                 )
 
-        cpu = sample.get(
-            "cpu"
-        )
+                if self.fps_limit > 0:
+                    fps_percent = (
+                        float(fps)
+                        / float(self.fps_limit)
+                        * 100.0
+                    )
 
-        if cpu is not None:
-            cpu_count = (
-                sample.get(
-                    "cpu_count"
-                )
-                or 1
-            )
+                    lines.append(
+                        f"FPS limit: {self.fps_limit}"
+                    )
 
-            normalized_cpu = (
-                float(cpu)
-                / float(cpu_count)
-            )
+                    lines.append(
+                        f"FPS load: {fps_percent:.1f}%"
+                    )
 
-            lines.append(
-                f"CPU: {float(cpu):.1f}% "
-                f"process "
-                f"({normalized_cpu:.1f}% total)"
-            )
+                else:
+                    lines.append(
+                        "FPS limit: Not configured"
+                    )
 
-        ram = sample.get(
-            "ram"
-        )
-
-        if ram is not None:
-            lines.append(
-                f"RAM: {float(ram):.1f}%"
-            )
-
-        fps = sample.get(
-            "fps"
-        )
-
-        if fps is not None:
-            lines.append(
-                f"FPS: {float(fps):.1f}"
-            )
+        if not lines:
+            QToolTip.hideText()
+            return
 
         QToolTip.showText(
             event.globalPosition().toPoint(),
@@ -816,7 +1141,6 @@ class LiveHistoryGraph(QWidget):
 
     def leaveEvent(self, event):
         QToolTip.hideText()
-
         super().leaveEvent(event)
 
 
@@ -838,7 +1162,9 @@ class StatusPanel(QWidget):
 
         self.ssh = ssh
         self.config = config
-        self.on_connection_changed = on_connection_changed
+        self.on_connection_changed = (
+            on_connection_changed
+        )
         self.jobs = WorkerRegistry()
 
         self.server_state = "unknown"
@@ -858,12 +1184,17 @@ class StatusPanel(QWidget):
 
         self.history_graph = None
 
+        # --------------------------------------------------------
+        # FPS CSV state
+        # --------------------------------------------------------
+
+        self.fps_csv_last_key = None
+        self.fps_csv_latest_fps = None
+        self.fps_csv_latest_timestamp = None
+
         layout = QVBoxLayout(self)
 
-        # ============================================================
         # Connection / overall status row
-        # ============================================================
-
         indicator_row = QHBoxLayout()
 
         self.lamp = Lamp(20)
@@ -876,8 +1207,12 @@ class StatusPanel(QWidget):
             "font-size: 16px; font-weight: 600;"
         )
 
-        indicator_row.addWidget(self.lamp)
-        indicator_row.addWidget(self.status_label)
+        indicator_row.addWidget(
+            self.lamp
+        )
+        indicator_row.addWidget(
+            self.status_label
+        )
 
         indicator_row.addStretch()
 
@@ -932,12 +1267,11 @@ class StatusPanel(QWidget):
             self.refresh_btn
         )
 
-        layout.addLayout(indicator_row)
+        layout.addLayout(
+            indicator_row
+        )
 
-        # ============================================================
         # Sudo password
-        # ============================================================
-
         sudo_row = QHBoxLayout()
 
         sudo_row.addWidget(
@@ -961,19 +1295,32 @@ class StatusPanel(QWidget):
             self.sudo_password_edit
         )
 
-        layout.addLayout(sudo_row)
+        layout.addLayout(
+            sudo_row
+        )
 
-        # ============================================================
         # Service controls
-        # ============================================================
-
         btn_row = QHBoxLayout()
 
-        self.start_btn = QPushButton("Start")
-        self.restart_btn = QPushButton("Restart")
-        self.stop_btn = QPushButton("Stop")
-        self.enable_btn = QPushButton("Enable")
-        self.disable_btn = QPushButton("Disable")
+        self.start_btn = QPushButton(
+            "Start"
+        )
+
+        self.restart_btn = QPushButton(
+            "Restart"
+        )
+
+        self.stop_btn = QPushButton(
+            "Stop"
+        )
+
+        self.enable_btn = QPushButton(
+            "Enable"
+        )
+
+        self.disable_btn = QPushButton(
+            "Disable"
+        )
 
         self.start_btn.clicked.connect(
             lambda: self.run_action("start")
@@ -1002,14 +1349,15 @@ class StatusPanel(QWidget):
             self.enable_btn,
             self.disable_btn,
         ):
-            btn_row.addWidget(button)
+            btn_row.addWidget(
+                button
+            )
 
-        layout.addLayout(btn_row)
+        layout.addLayout(
+            btn_row
+        )
 
-        # ============================================================
         # Systemd service status box
-        # ============================================================
-
         status_group = QGroupBox(
             "Service Status — LIVE"
         )
@@ -1020,7 +1368,9 @@ class StatusPanel(QWidget):
 
         self.status_output = QPlainTextEdit()
 
-        self.status_output.setReadOnly(True)
+        self.status_output.setReadOnly(
+            True
+        )
 
         self.status_output.setLineWrapMode(
             QPlainTextEdit.NoWrap
@@ -1038,8 +1388,13 @@ class StatusPanel(QWidget):
             "font-family: monospace;"
         )
 
-        self.status_output.setMinimumHeight(230)
-        self.status_output.setMaximumHeight(230)
+        self.status_output.setMinimumHeight(
+            230
+        )
+
+        self.status_output.setMaximumHeight(
+            230
+        )
 
         self.status_highlighter = (
             ServiceStatusHighlighter(
@@ -1051,12 +1406,11 @@ class StatusPanel(QWidget):
             self.status_output
         )
 
-        layout.addWidget(status_group)
+        layout.addWidget(
+            status_group
+        )
 
-        # ============================================================
         # Resource monitor
-        # ============================================================
-
         resource_group = QGroupBox(
             "Server Resources — LIVE"
         )
@@ -1096,10 +1450,7 @@ class StatusPanel(QWidget):
             resource_group
         )
 
-        # ============================================================
         # A2S Server Stats
-        # ============================================================
-
         a2s_group = QGroupBox(
             "A2S Server Stats — LIVE"
         )
@@ -1127,7 +1478,9 @@ class StatusPanel(QWidget):
             "after connecting."
         )
 
-        self.a2s_details_label.setWordWrap(True)
+        self.a2s_details_label.setWordWrap(
+            True
+        )
 
         self.a2s_details_label.setStyleSheet(
             "font-family: monospace;"
@@ -1175,8 +1528,13 @@ class StatusPanel(QWidget):
                 f"{minutes}m"
             )
 
-            button.setCheckable(True)
-            button.setFixedWidth(42)
+            button.setCheckable(
+                True
+            )
+
+            button.setFixedWidth(
+                42
+            )
 
             button.clicked.connect(
                 lambda checked=False,
@@ -1198,8 +1556,14 @@ class StatusPanel(QWidget):
             graph_header
         )
 
-        self.history_graph = (
-            LiveHistoryGraph()
+        self.history_graph = LiveHistoryGraph()
+
+        # FPS limit is deliberately NOT taken from config.limit_fps.
+        #
+        # The authoritative value is read from the actual systemd unit
+        # on the remote server during live refresh.
+        self.history_graph.set_fps_limit(
+            0
         )
 
         graph_layout.addWidget(
@@ -1214,16 +1578,15 @@ class StatusPanel(QWidget):
 
         self.graph_range_buttons[
             5
-        ].setChecked(True)
+        ].setChecked(
+            True
+        )
 
         layout.addWidget(
             a2s_group
         )
 
-        # ============================================================
         # Server log box
-        # ============================================================
-
         log_group = QGroupBox(
             "Server Log — LIVE"
         )
@@ -1234,7 +1597,9 @@ class StatusPanel(QWidget):
 
         self.log_output = QPlainTextEdit()
 
-        self.log_output.setReadOnly(True)
+        self.log_output.setReadOnly(
+            True
+        )
 
         self.log_output.setLineWrapMode(
             QPlainTextEdit.NoWrap
@@ -1259,10 +1624,7 @@ class StatusPanel(QWidget):
             1,
         )
 
-        # ============================================================
         # Log search
-        # ============================================================
-
         search_row = QHBoxLayout()
 
         search_row.addWidget(
@@ -1333,10 +1695,7 @@ class StatusPanel(QWidget):
             1,
         )
 
-        # ============================================================
         # LIVE polling timer
-        # ============================================================
-
         self.timer = QTimer(self)
 
         self.timer.setInterval(
@@ -1347,10 +1706,7 @@ class StatusPanel(QWidget):
             self.refresh_status
         )
 
-        # ============================================================
-        # Initial display.
-        # ============================================================
-
+        # Initial display
         self.status_output.setPlainText(
             "Click Connect to open an SSH session and begin "
             "live server monitoring."
@@ -1383,45 +1739,299 @@ class StatusPanel(QWidget):
             minutes
         )
 
-    def _extract_server_fps(
-        self,
-        log_text,
-    ):
+    def _fps_csv_directory(self):
         """
-        Look for an explicit FPS value in the DayZ log.
+        Return the DayZ FPSLogger directory.
+
+        The logger writes:
+
+            <profiles_dir>/dzmanager/fps_YYYY-M-D.csv
+
+        profiles_dir is the authoritative path from AppConfig.
         """
 
-        if not log_text:
-            return None
+        profiles_dir = str(
+            getattr(
+                self.config,
+                "profiles_dir",
+                "",
+            )
+            or ""
+        ).strip().rstrip("/")
 
-        patterns = (
-            r"(?im)\bserver\s+fps\s*[:=]\s*"
-            r"(\d+(?:\.\d+)?)",
+        if not profiles_dir:
+            return ""
 
-            r"(?im)\bfps\s*[:=]\s*"
-            r"(\d+(?:\.\d+)?)",
+        return (
+            profiles_dir
+            + "/dzmanager"
         )
 
-        for pattern in patterns:
-            matches = re.findall(
-                pattern,
-                log_text,
+    def _parse_fps_csv(
+        self,
+        csv_text,
+    ):
+        """
+        Parse FPSLogger CSV text.
+
+        Expected format:
+
+            timestamp,server_fps,frames,elapsed_seconds
+            2026-9-6 12:30:37,196,1965,10.0001
+
+        Returns:
+
+            (row_key, timestamp, fps)
+
+        for the newest valid row, or None.
+        """
+
+        if not csv_text:
+            return None
+
+        newest = None
+
+        lines = csv_text.splitlines()
+
+        if not lines:
+            return None
+
+        for line in reversed(lines):
+            stripped = line.strip()
+
+            if not stripped:
+                continue
+
+            if stripped.lower() == (
+                "timestamp,server_fps,frames,elapsed_seconds"
+            ):
+                continue
+
+            parts = stripped.split(",")
+
+            if len(parts) < 4:
+                continue
+
+            timestamp_text = parts[0].strip()
+            fps_text = parts[1].strip()
+            frames_text = parts[2].strip()
+            elapsed_text = parts[3].strip()
+
+            try:
+                fps = float(
+                    fps_text
+                )
+
+                frames = int(
+                    frames_text
+                )
+
+                elapsed = float(
+                    elapsed_text
+                )
+
+            except (
+                ValueError,
+                TypeError,
+            ):
+                continue
+
+            if fps < 0:
+                continue
+
+            if frames <= 0:
+                continue
+
+            if elapsed <= 0:
+                continue
+
+            try:
+                parsed_struct = time.strptime(
+                    timestamp_text,
+                    "%Y-%m-%d %H:%M:%S",
+                )
+
+                timestamp = time.mktime(
+                    parsed_struct
+                )
+
+            except ValueError:
+                continue
+
+            row_key = (
+                timestamp_text,
+                fps_text,
+                frames_text,
+                elapsed_text,
             )
 
-            if matches:
-                try:
-                    return float(
-                        matches[-1]
-                    )
-                except ValueError:
-                    pass
+            newest = (
+                row_key,
+                timestamp,
+                fps,
+            )
 
-        return None
+            break
+
+        return newest
+
+    def _fetch_fps_csv(self):
+        """
+        Read the newest DayZ FPS CSV through SSH.
+
+        The logger writes files into:
+
+            <profiles_dir>/dzmanager/
+
+        The newest file by server-side modification time is selected.
+        """
+
+        directory = (
+            self._fps_csv_directory()
+        )
+
+        if not directory:
+            return {
+                "ok": False,
+                "exists": False,
+                "path": "",
+                "error": (
+                    "The configured DayZ profiles directory is empty."
+                ),
+            }
+
+        quoted_directory = (
+            self._shell_quote(
+                directory
+            )
+        )
+
+        command = (
+            "latest_fps_file=$(ls -1t "
+            + quoted_directory
+            + "/fps_*.csv 2>/dev/null | head -n 1); "
+            "if [ -n \"$latest_fps_file\" ]; then "
+            "tail -n 5 \"$latest_fps_file\"; "
+            "else "
+            "exit 2; "
+            "fi"
+        )
+
+        code, out, err = self.ssh.exec(
+            command
+        )
+
+        if code != 0:
+            return {
+                "ok": False,
+                "exists": False,
+                "path": directory,
+                "error": (
+                    err.strip()
+                    or "FPS CSV does not exist yet."
+                ),
+            }
+
+        parsed = self._parse_fps_csv(
+            out or ""
+        )
+
+        if parsed is None:
+            return {
+                "ok": False,
+                "exists": True,
+                "path": directory,
+                "error": (
+                    "The FPS CSV exists but contains "
+                    "no valid FPS rows yet."
+                ),
+            }
+
+        row_key, timestamp, fps = (
+            parsed
+        )
+
+        return {
+            "ok": True,
+            "exists": True,
+            "path": directory,
+            "row_key": row_key,
+            "timestamp": timestamp,
+            "fps": fps,
+        }
+
+    def _update_fps_history(
+        self,
+        fps_result,
+    ):
+        """
+        Import the newest FPSLogger measurement.
+
+        A CSV row is only imported once. This prevents the same
+        10-second FPS measurement from becoming ten identical graph
+        samples while the GUI polls once per second.
+        """
+
+        if not fps_result:
+            return
+
+        if not fps_result.get(
+            "ok"
+        ):
+            return
+
+        row_key = fps_result.get(
+            "row_key"
+        )
+
+        timestamp = fps_result.get(
+            "timestamp"
+        )
+
+        fps = fps_result.get(
+            "fps"
+        )
+
+        if (
+            row_key is None
+            or timestamp is None
+            or fps is None
+        ):
+            return
+
+        if (
+            row_key
+            == self.fps_csv_last_key
+        ):
+            return
+
+        self.fps_csv_last_key = (
+            row_key
+        )
+
+        self.fps_csv_latest_timestamp = (
+            timestamp
+        )
+
+        self.fps_csv_latest_fps = (
+            fps
+        )
+
+        self.history_graph.add_sample(
+            timestamp,
+            fps=fps,
+        )
 
     def _update_history_graph(
         self,
-        log_text="",
     ):
+        """
+        Add the current GUI sample for Players/CPU/RAM.
+
+        FPS is imported separately from the DayZ CSV so its graph
+        timestamp remains the actual FPS measurement timestamp.
+        """
+
         if self.history_graph is None:
             return
 
@@ -1458,17 +2068,17 @@ class StatusPanel(QWidget):
             if self.resource_stats.get(
                 "ok"
             ):
-                cpu = self.resource_stats.get(
-                    "cpu"
+                cpu = (
+                    self.resource_stats.get(
+                        "cpu"
+                    )
                 )
 
-                ram = self.resource_stats.get(
-                    "memory_percent"
+                ram = (
+                    self.resource_stats.get(
+                        "memory_percent"
+                    )
                 )
-
-        fps = self._extract_server_fps(
-            log_text
-        )
 
         self.history_graph.add_sample(
             time.time(),
@@ -1477,8 +2087,375 @@ class StatusPanel(QWidget):
             cpu_percent=cpu,
             cpu_count=cpu_count,
             ram_percent=ram,
-            fps=fps,
         )
+
+    # ================================================================
+    # SYSTEMD FPS LIMIT
+    # ================================================================
+
+    def _systemd_unit_path(
+        self,
+        service_name,
+    ):
+        """
+        Return the conventional systemd unit path.
+
+        This is only used as a fallback when systemd itself cannot
+        provide FragmentPath.
+
+        If systemd_service is:
+
+            dayz-server
+
+        the conventional fallback is:
+
+            /etc/systemd/system/dayz-server
+
+        If it is:
+
+            dayz-server.service
+
+        the conventional fallback is:
+
+            /etc/systemd/system/dayz-server.service
+
+        Absolute paths are returned unchanged.
+        """
+
+        service_name = str(
+            service_name or ""
+        ).strip()
+
+        if not service_name:
+            return ""
+
+        if service_name.startswith("/"):
+            return service_name
+
+        return (
+            "/etc/systemd/system/"
+            + service_name.lstrip("/")
+        )
+
+    @staticmethod
+    def _extract_systemd_execstart(
+        unit_text,
+    ):
+        """
+        Extract ExecStart from a systemd unit file.
+
+        Handles systemd continuation lines such as:
+
+            ExecStart=/path/dayz \
+                -config=serverDZ.cfg \
+                -limitFPS=200
+
+        The continuation backslashes are removed before parsing.
+        """
+
+        if not unit_text:
+            return ""
+
+        parts = []
+        collecting = False
+
+        for raw_line in unit_text.splitlines():
+            line = raw_line.strip()
+
+            if not collecting:
+                if not line.startswith(
+                    "ExecStart="
+                ):
+                    continue
+
+                value = line[
+                    len("ExecStart="):
+                ].strip()
+
+                parts.append(
+                    value
+                )
+
+                if value.rstrip().endswith(
+                    "\\"
+                ):
+                    collecting = True
+
+                    parts[-1] = (
+                        parts[-1]
+                        .rstrip()[:-1]
+                        .rstrip()
+                    )
+
+                else:
+                    break
+
+            else:
+                value = line
+
+                has_continuation = (
+                    value.rstrip().endswith(
+                        "\\"
+                    )
+                )
+
+                if has_continuation:
+                    value = (
+                        value.rstrip()[:-1]
+                        .rstrip()
+                    )
+
+                parts.append(
+                    value
+                )
+
+                if not has_continuation:
+                    break
+
+        return " ".join(
+            part
+            for part in parts
+            if part
+        )
+
+    @staticmethod
+    def _extract_limit_fps_from_execstart(
+        exec_start,
+    ):
+        """
+        Extract the DayZ -limitFPS value from ExecStart.
+
+        Supported forms:
+
+            -limitFPS=200
+            -limitFPS 200
+
+        Quoted values are also accepted:
+
+            -limitFPS="200"
+            -limitFPS='200'
+
+        Returns:
+
+            (configured, limit_fps)
+
+        where configured is False when no -limitFPS parameter exists.
+        """
+
+        if not exec_start:
+            return (
+                False,
+                0,
+            )
+
+        match = re.search(
+            r"(?:^|\s)"
+            r"-limitFPS"
+            r"(?:=|\s+)"
+            r"(?:"
+            r'"([^"]+)"'
+            r"|"
+            r"'([^']+)'"
+            r"|"
+            r"([^\s]+)"
+            r")",
+            exec_start,
+            re.IGNORECASE,
+        )
+
+        if not match:
+            return (
+                False,
+                0,
+            )
+
+        value = (
+            match.group(1)
+            or match.group(2)
+            or match.group(3)
+            or ""
+        ).strip()
+
+        try:
+            limit_fps = int(
+                value
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            return (
+                False,
+                0,
+            )
+
+        if limit_fps < 0:
+            return (
+                False,
+                0,
+            )
+
+        return (
+            True,
+            limit_fps,
+        )
+
+    def _fetch_systemd_fps_limit(
+        self,
+        service_name,
+    ):
+        """
+        Read the actual systemd unit selected by systemd and extract
+        the configured DayZ -limitFPS value.
+
+        This intentionally does NOT use config.limit_fps.
+
+        FragmentPath from systemd is authoritative for locating the
+        installed unit file. This avoids assuming the unit is named:
+
+            /etc/systemd/system/<service>
+
+        or:
+
+            /etc/systemd/system/<service>.service
+        """
+
+        service_name = str(
+            service_name or ""
+        ).strip()
+
+        if not service_name:
+            return {
+                "ok": False,
+                "path": "",
+                "configured": False,
+                "limit_fps": 0,
+                "error": (
+                    "The configured systemd service name is empty."
+                ),
+            }
+
+        # Ask systemd where the installed unit actually comes from.
+        #
+        # For the user's server this should return:
+        #
+        # /etc/systemd/system/dayz-server.service
+        #
+        # This is the authoritative path selected by systemd.
+        fragment_command = (
+            "systemctl show "
+            + self._shell_quote(
+                service_name
+            )
+            + " -p FragmentPath --value --no-pager"
+        )
+
+        (
+            fragment_code,
+            fragment_out,
+            fragment_err,
+        ) = self.ssh.exec(
+            fragment_command
+        )
+
+        unit_path = ""
+
+        if fragment_code == 0:
+            for line in (
+                fragment_out or ""
+            ).splitlines():
+                candidate = line.strip()
+
+                # FragmentPath must be an absolute filesystem path.
+                if candidate.startswith(
+                    "/"
+                ):
+                    unit_path = candidate
+                    break
+
+        # Fallback for environments where FragmentPath could not be
+        # obtained. This preserves support for explicitly configured
+        # absolute paths and the conventional systemd path.
+        if not unit_path:
+            unit_path = (
+                self._systemd_unit_path(
+                    service_name
+                )
+            )
+
+        if not unit_path:
+            return {
+                "ok": False,
+                "path": "",
+                "configured": False,
+                "limit_fps": 0,
+                "error": (
+                    fragment_err.strip()
+                    or (
+                        "Could not determine the installed "
+                        "systemd unit path."
+                    )
+                ),
+            }
+
+        command = (
+            "cat "
+            + self._shell_quote(
+                unit_path
+            )
+        )
+
+        code, out, err = self.ssh.exec(
+            command
+        )
+
+        if code != 0:
+            return {
+                "ok": False,
+                "path": unit_path,
+                "configured": False,
+                "limit_fps": 0,
+                "error": (
+                    err.strip()
+                    or out.strip()
+                    or (
+                        "Could not read the systemd unit file."
+                    )
+                ),
+            }
+
+        exec_start = (
+            self._extract_systemd_execstart(
+                out or ""
+            )
+        )
+
+        if not exec_start:
+            return {
+                "ok": True,
+                "path": unit_path,
+                "configured": False,
+                "limit_fps": 0,
+                "error": (
+                    "No ExecStart parameter was found "
+                    "in the systemd unit."
+                ),
+            }
+
+        configured, limit_fps = (
+            self._extract_limit_fps_from_execstart(
+                exec_start
+            )
+        )
+
+        return {
+            "ok": True,
+            "path": unit_path,
+            "configured": configured,
+            "limit_fps": limit_fps,
+            "exec_start": exec_start,
+        }
 
     # ================================================================
     # Connect / Disconnect
@@ -1487,6 +2464,7 @@ class StatusPanel(QWidget):
     def toggle_connection(self):
         if self.ssh.is_connected():
             self.disconnect_ssh()
+
         else:
             self.connect_ssh()
 
@@ -1498,14 +2476,29 @@ class StatusPanel(QWidget):
                 "Fill in SSH host, username, and key path "
                 "on the Settings tab first.",
             )
+
             return
 
-        self.connect_btn.setEnabled(False)
+        self.connect_btn.setEnabled(
+            False
+        )
 
         self.server_state = "unknown"
         self.refresh_running = False
         self.a2s_request_running = False
         self.remote_cpu_count = 1
+
+        self.fps_csv_last_key = None
+        self.fps_csv_latest_fps = None
+        self.fps_csv_latest_timestamp = None
+
+        # Do NOT use config.limit_fps here.
+        #
+        # The actual systemd unit is read during refresh_status()
+        # and becomes the authoritative FPS graph reference.
+        self.history_graph.set_fps_limit(
+            0
+        )
 
         self.history_graph.clear_history()
 
@@ -1523,7 +2516,9 @@ class StatusPanel(QWidget):
             "color: #FF9800;"
         )
 
-        self.lamp.set_state("amber")
+        self.lamp.set_state(
+            "amber"
+        )
 
         def task():
             self.ssh.connect()
@@ -1535,8 +2530,13 @@ class StatusPanel(QWidget):
             on_fail=self._on_connect_failed,
         )
 
-    def _on_connected(self, _result):
-        self.connect_btn.setEnabled(True)
+    def _on_connected(
+        self,
+        _result,
+    ):
+        self.connect_btn.setEnabled(
+            True
+        )
 
         self.connect_btn.setText(
             "Disconnect"
@@ -1565,14 +2565,29 @@ class StatusPanel(QWidget):
         self.refresh_status()
 
         if self.on_connection_changed:
-            self.on_connection_changed(True)
+            self.on_connection_changed(
+                True
+            )
 
-    def _on_connect_failed(self, error):
-        self.connect_btn.setEnabled(True)
+    def _on_connect_failed(
+        self,
+        error,
+    ):
+        self.connect_btn.setEnabled(
+            True
+        )
 
         self.server_state = "unknown"
         self.refresh_running = False
         self.a2s_request_running = False
+
+        self.fps_csv_last_key = None
+        self.fps_csv_latest_fps = None
+        self.fps_csv_latest_timestamp = None
+
+        self.history_graph.set_fps_limit(
+            0
+        )
 
         self.history_graph.clear_history()
 
@@ -1590,7 +2605,9 @@ class StatusPanel(QWidget):
             "color: #F44336;"
         )
 
-        self.lamp.set_state("red")
+        self.lamp.set_state(
+            "red"
+        )
 
         self.status_output.setPlainText(
             str(error)
@@ -1600,7 +2617,9 @@ class StatusPanel(QWidget):
             "Unable to connect to the server."
         )
 
-        self._set_action_buttons_enabled(False)
+        self._set_action_buttons_enabled(
+            False
+        )
 
         self._clear_a2s_display(
             "Not connected"
@@ -1617,6 +2636,14 @@ class StatusPanel(QWidget):
         self.ssh.close()
 
         self.server_state = "unknown"
+
+        self.fps_csv_last_key = None
+        self.fps_csv_latest_fps = None
+        self.fps_csv_latest_timestamp = None
+
+        self.history_graph.set_fps_limit(
+            0
+        )
 
         self.history_graph.clear_history()
 
@@ -1644,7 +2671,9 @@ class StatusPanel(QWidget):
             "Last update: --"
         )
 
-        self.lamp.set_state("off")
+        self.lamp.set_state(
+            "off"
+        )
 
         self.status_output.setPlainText(
             "Click Connect to open an SSH session and begin "
@@ -1655,7 +2684,9 @@ class StatusPanel(QWidget):
             "Server log will appear here after connecting."
         )
 
-        self._set_action_buttons_enabled(False)
+        self._set_action_buttons_enabled(
+            False
+        )
 
         self._clear_a2s_display(
             "Not connected"
@@ -1664,7 +2695,9 @@ class StatusPanel(QWidget):
         self._clear_resource_display()
 
         if self.on_connection_changed:
-            self.on_connection_changed(False)
+            self.on_connection_changed(
+                False
+            )
 
     # ================================================================
     # Button state
@@ -1682,7 +2715,9 @@ class StatusPanel(QWidget):
             self.disable_btn,
             self.refresh_btn,
         ):
-            button.setEnabled(enabled)
+            button.setEnabled(
+                enabled
+            )
 
         self.log_search_edit.setEnabled(
             enabled
@@ -1704,30 +2739,43 @@ class StatusPanel(QWidget):
     # Generic SSH runner
     # ================================================================
 
-    def _run(self, fn, on_ok):
+    def _run(
+        self,
+        fn,
+        on_ok,
+    ):
         if not self.ssh.is_connected():
             QMessageBox.information(
                 self,
                 "Not connected",
                 "Click Connect first.",
             )
+
             return
 
-        self._set_action_buttons_enabled(False)
+        self._set_action_buttons_enabled(
+            False
+        )
 
         def success(result):
             on_ok(result)
 
             if self.ssh.is_connected():
-                self._set_action_buttons_enabled(True)
+                self._set_action_buttons_enabled(
+                    True
+                )
 
                 self.refresh_status()
 
         def failure(error):
-            self._on_error(error)
+            self._on_error(
+                error
+            )
 
             if self.ssh.is_connected():
-                self._set_action_buttons_enabled(True)
+                self._set_action_buttons_enabled(
+                    True
+                )
 
         self.jobs.start(
             fn,
@@ -1735,7 +2783,10 @@ class StatusPanel(QWidget):
             on_fail=failure,
         )
 
-    def _on_error(self, err):
+    def _on_error(
+        self,
+        err,
+    ):
         self.server_state = "unknown"
 
         self.status_label.setText(
@@ -1752,7 +2803,9 @@ class StatusPanel(QWidget):
             "color: #F44336;"
         )
 
-        self.lamp.set_state("red")
+        self.lamp.set_state(
+            "red"
+        )
 
         self.status_output.setPlainText(
             str(err)
@@ -1784,20 +2837,30 @@ class StatusPanel(QWidget):
         self.refresh_running = True
 
         def task():
-            service_name = self.config.systemd_service
+            service_name = (
+                self.config.systemd_service
+            )
 
-            status_result = self.ssh.service_status(
-                service_name
+            status_result = (
+                self.ssh.service_status(
+                    service_name
+                )
             )
 
             active_command = (
                 "systemctl is-active "
-                + self._shell_quote(service_name)
+                + self._shell_quote(
+                    service_name
+                )
                 + " 2>/dev/null || true"
             )
 
-            active_code, active_out, active_err = (
-                self.ssh.exec(active_command)
+            (
+                active_code,
+                active_out,
+                active_err,
+            ) = self.ssh.exec(
+                active_command
             )
 
             active_lines = (
@@ -1812,14 +2875,19 @@ class StatusPanel(QWidget):
                     .strip()
                     .lower()
                 )
+
             else:
                 active_state = "unknown"
 
             log_command = (
                 "journalctl -q -u "
-                + self._shell_quote(service_name)
+                + self._shell_quote(
+                    service_name
+                )
                 + " -n "
-                + str(self.MAX_LOG_LINES)
+                + str(
+                    self.MAX_LOG_LINES
+                )
                 + " --no-pager"
             )
 
@@ -1827,8 +2895,26 @@ class StatusPanel(QWidget):
                 log_command
             )
 
-            resource_result = self._fetch_resource_stats(
-                service_name
+            resource_result = (
+                self._fetch_resource_stats(
+                    service_name
+                )
+            )
+
+            fps_result = (
+                self._fetch_fps_csv()
+            )
+
+            # --------------------------------------------------------
+            # IMPORTANT:
+            # Read the actual systemd unit every monitoring cycle.
+            # This makes the unit file the authoritative FPS limit.
+            # --------------------------------------------------------
+
+            fps_limit_result = (
+                self._fetch_systemd_fps_limit(
+                    service_name
+                )
             )
 
             now = time.monotonic()
@@ -1836,14 +2922,18 @@ class StatusPanel(QWidget):
             if (
                 not self.a2s_request_running
                 and (
-                    now - self.last_a2s_time
-                    >= self.A2S_INTERVAL_MS / 1000.0
+                    now
+                    - self.last_a2s_time
+                    >= self.A2S_INTERVAL_MS
+                    / 1000.0
                 )
             ):
                 self.a2s_request_running = True
                 self.last_a2s_time = now
 
-                a2s_result = self._fetch_a2s_stats()
+                a2s_result = (
+                    self._fetch_a2s_stats()
+                )
 
             else:
                 a2s_result = None
@@ -1854,13 +2944,19 @@ class StatusPanel(QWidget):
                 active_state,
                 resource_result,
                 a2s_result,
+                fps_result,
+                fps_limit_result,
             )
 
         def success(result):
             try:
-                self._on_status_result(result)
+                self._on_status_result(
+                    result
+                )
 
-                self.last_refresh_time = time.monotonic()
+                self.last_refresh_time = (
+                    time.monotonic()
+                )
 
                 self.update_label.setText(
                     "Last update: now"
@@ -1883,7 +2979,9 @@ class StatusPanel(QWidget):
             self.refresh_running = False
             self.a2s_request_running = False
 
-            self._on_error(error)
+            self._on_error(
+                error
+            )
 
         self.jobs.start(
             task,
@@ -1901,11 +2999,17 @@ class StatusPanel(QWidget):
     ):
         pid_command = (
             "systemctl show "
-            + self._shell_quote(service_name)
+            + self._shell_quote(
+                service_name
+            )
             + " -p MainPID --no-pager"
         )
 
-        pid_code, pid_out, pid_err = self.ssh.exec(
+        (
+            pid_code,
+            pid_out,
+            pid_err,
+        ) = self.ssh.exec(
             pid_command
         )
 
@@ -1927,11 +3031,16 @@ class StatusPanel(QWidget):
         if not pid_match:
             return {
                 "ok": False,
-                "error": "MainPID was not returned.",
+                "error": (
+                    "MainPID was not returned."
+                ),
             }
 
         try:
-            pid = int(pid_match.group(1))
+            pid = int(
+                pid_match.group(1)
+            )
+
         except ValueError:
             return {
                 "ok": False,
@@ -1942,7 +3051,9 @@ class StatusPanel(QWidget):
             return {
                 "ok": False,
                 "pid": 0,
-                "error": "Service is not currently running.",
+                "error": (
+                    "Service is not currently running."
+                ),
             }
 
         ps_command = (
@@ -1951,7 +3062,11 @@ class StatusPanel(QWidget):
             + " -o pid=,%cpu=,%mem=,rss=,etime=,comm="
         )
 
-        ps_code, ps_out, ps_err = self.ssh.exec(
+        (
+            ps_code,
+            ps_out,
+            ps_err,
+        ) = self.ssh.exec(
             ps_command
         )
 
@@ -1968,7 +3083,9 @@ class StatusPanel(QWidget):
 
         line = ""
 
-        for candidate in (ps_out or "").splitlines():
+        for candidate in (
+            ps_out or ""
+        ).splitlines():
             if candidate.strip():
                 line = candidate.strip()
                 break
@@ -1977,10 +3094,15 @@ class StatusPanel(QWidget):
             return {
                 "ok": False,
                 "pid": pid,
-                "error": "Process statistics were empty.",
+                "error": (
+                    "Process statistics were empty."
+                ),
             }
 
-        parts = line.split(None, 5)
+        parts = line.split(
+            None,
+            5,
+        )
 
         if len(parts) < 6:
             return {
@@ -1992,13 +3114,29 @@ class StatusPanel(QWidget):
             }
 
         try:
-            parsed_pid = int(parts[0])
-            cpu = float(parts[1])
-            memory_percent = float(parts[2])
-            rss_kib = int(parts[3])
+            parsed_pid = int(
+                parts[0]
+            )
+
+            cpu = float(
+                parts[1]
+            )
+
+            memory_percent = float(
+                parts[2]
+            )
+
+            rss_kib = int(
+                parts[3]
+            )
+
             elapsed = parts[4]
             command = parts[5]
-        except (ValueError, IndexError):
+
+        except (
+            ValueError,
+            IndexError,
+        ):
             return {
                 "ok": False,
                 "pid": pid,
@@ -2015,16 +3153,20 @@ class StatusPanel(QWidget):
                 "|| echo 1"
             )
 
-            cpu_count_code, cpu_count_out, cpu_count_err = (
-                self.ssh.exec(
-                    cpu_count_command
-                )
+            (
+                cpu_count_code,
+                cpu_count_out,
+                cpu_count_err,
+            ) = self.ssh.exec(
+                cpu_count_command
             )
 
             if cpu_count_code == 0:
                 try:
                     detected_cpu_count = int(
-                        cpu_count_out.strip().splitlines()[0]
+                        cpu_count_out
+                        .strip()
+                        .splitlines()[0]
                     )
 
                     if detected_cpu_count > 0:
@@ -2060,13 +3202,18 @@ class StatusPanel(QWidget):
             self._clear_resource_display()
             return
 
-        if not result.get("ok"):
-            pid = result.get("pid")
+        if not result.get(
+            "ok"
+        ):
+            pid = result.get(
+                "pid"
+            )
 
             if pid:
                 self.resource_status_label.setText(
                     f"PID: {pid}    Resource data unavailable"
                 )
+
             else:
                 self.resource_status_label.setText(
                     "CPU: --    RAM: --    PID: --    Uptime: --"
@@ -2115,7 +3262,10 @@ class StatusPanel(QWidget):
             "",
         )
 
-        rss_mb = rss_kib / 1024.0
+        rss_mb = (
+            rss_kib
+            / 1024.0
+        )
 
         self.resource_status_label.setText(
             f"CPU: {cpu:.1f}%    "
@@ -2131,7 +3281,9 @@ class StatusPanel(QWidget):
 
         self.resource_stats = result
 
-    def _clear_resource_display(self):
+    def _clear_resource_display(
+        self,
+    ):
         self.resource_stats = None
 
         self.resource_status_label.setText(
@@ -2147,17 +3299,27 @@ class StatusPanel(QWidget):
     # A2S SERVER STATS
     # ================================================================
 
-    def _fetch_a2s_stats(self):
-        service_name = self.config.systemd_service
+    def _fetch_a2s_stats(
+        self,
+    ):
+        service_name = (
+            self.config.systemd_service
+        )
 
         inspect_command = (
             "systemctl show "
-            + self._shell_quote(service_name)
+            + self._shell_quote(
+                service_name
+            )
             + " -p ExecStart -p WorkingDirectory --no-pager"
         )
 
-        inspect_code, inspect_out, inspect_err = (
-            self.ssh.exec(inspect_command)
+        (
+            inspect_code,
+            inspect_out,
+            inspect_err,
+        ) = self.ssh.exec(
+            inspect_command
         )
 
         if inspect_code != 0:
@@ -2170,28 +3332,39 @@ class StatusPanel(QWidget):
         working_directory = ""
 
         for line in inspect_out.splitlines():
-            if line.startswith("ExecStart="):
+            if line.startswith(
+                "ExecStart="
+            ):
                 exec_start = (
-                    line[len("ExecStart="):]
-                    .strip()
+                    line[
+                        len("ExecStart="):
+                    ].strip()
                 )
 
-            elif line.startswith("WorkingDirectory="):
+            elif line.startswith(
+                "WorkingDirectory="
+            ):
                 working_directory = (
-                    line[len("WorkingDirectory="):]
-                    .strip()
+                    line[
+                        len("WorkingDirectory="):
+                    ].strip()
                 )
 
-        config_path = self._extract_config_path(
-            exec_start
+        config_path = (
+            self._extract_config_path(
+                exec_start
+            )
         )
 
         if not config_path:
             if working_directory:
                 config_path = (
-                    working_directory.rstrip("/")
+                    working_directory.rstrip(
+                        "/"
+                    )
                     + "/serverDZ.cfg"
                 )
+
             else:
                 server_root = str(
                     getattr(
@@ -2200,7 +3373,9 @@ class StatusPanel(QWidget):
                         "",
                     )
                     or ""
-                ).strip().rstrip("/")
+                ).strip().rstrip(
+                    "/"
+                )
 
                 if server_root:
                     config_path = (
@@ -2214,13 +3389,20 @@ class StatusPanel(QWidget):
                 "using default query port 27016."
             )
 
-        if not config_path.startswith("/"):
+        if not config_path.startswith(
+            "/"
+        ):
             if working_directory:
                 config_path = (
-                    working_directory.rstrip("/")
+                    working_directory.rstrip(
+                        "/"
+                    )
                     + "/"
-                    + config_path.lstrip("/")
+                    + config_path.lstrip(
+                        "/"
+                    )
                 )
+
             else:
                 server_root = str(
                     getattr(
@@ -2229,22 +3411,32 @@ class StatusPanel(QWidget):
                         "",
                     )
                     or ""
-                ).strip().rstrip("/")
+                ).strip().rstrip(
+                    "/"
+                )
 
                 if server_root:
                     config_path = (
                         server_root
                         + "/"
-                        + config_path.lstrip("/")
+                        + config_path.lstrip(
+                            "/"
+                        )
                     )
 
         read_command = (
             "cat "
-            + self._shell_quote(config_path)
+            + self._shell_quote(
+                config_path
+            )
         )
 
-        read_code, config_text, read_err = (
-            self.ssh.exec(read_command)
+        (
+            read_code,
+            config_text,
+            read_err,
+        ) = self.ssh.exec(
+            read_command
         )
 
         if read_code != 0:
@@ -2270,15 +3462,20 @@ class StatusPanel(QWidget):
                 )
 
                 if not (
-                    1 <= query_port <= 65535
+                    1
+                    <= query_port
+                    <= 65535
                 ):
                     raise ValueError
 
             except ValueError:
                 query_port = 27016
                 query_source = "default"
+
             else:
-                query_source = "serverDZ.cfg"
+                query_source = (
+                    "serverDZ.cfg"
+                )
 
         else:
             query_port = 27016
@@ -2408,17 +3605,26 @@ class StatusPanel(QWidget):
 
         return value
 
-    def _on_a2s_result(self, result):
+    def _on_a2s_result(
+        self,
+        result,
+    ):
         if result is None:
             return
 
         self.a2s_request_running = False
 
-        if not result.get("ok"):
-            self._show_a2s_error(result)
+        if not result.get(
+            "ok"
+        ):
+            self._show_a2s_error(
+                result
+            )
             return
 
-        info = result.get("info")
+        info = result.get(
+            "info"
+        )
 
         if info is None:
             self._clear_a2s_display(
@@ -2428,13 +3634,17 @@ class StatusPanel(QWidget):
 
         self.a2s_stats = result
 
-        self._display_a2s_info(result)
+        self._display_a2s_info(
+            result
+        )
 
     def _display_a2s_info(
         self,
         result,
     ):
-        info = result.get("info")
+        info = result.get(
+            "info"
+        )
 
         query_port = result.get(
             "query_port",
@@ -2506,11 +3716,14 @@ class StatusPanel(QWidget):
             and max_players is not None
         ):
             players_text = (
-                f"{player_count} / {max_players}"
+                f"{player_count} / "
+                f"{max_players}"
             )
 
         elif player_count is not None:
-            players_text = str(player_count)
+            players_text = str(
+                player_count
+            )
 
         else:
             players_text = "Unknown"
@@ -2519,9 +3732,14 @@ class StatusPanel(QWidget):
             self.config.host
         ).strip()
 
-        if host and getattr(info, "port", None):
+        if host and getattr(
+            info,
+            "port",
+            None,
+        ):
             address = (
-                f"{host}:{getattr(info, 'port')}"
+                f"{host}:"
+                f"{getattr(info, 'port')}"
             )
 
         elif host:
@@ -2530,11 +3748,14 @@ class StatusPanel(QWidget):
         else:
             address = "Unknown"
 
-        if query_source == "serverDZ.cfg":
+        if query_source == (
+            "serverDZ.cfg"
+        ):
             query_text = (
                 f"{query_port} "
                 "(serverDZ.cfg)"
             )
+
         else:
             query_text = (
                 f"{query_port} "
@@ -2614,11 +3835,14 @@ class StatusPanel(QWidget):
             "default",
         )
 
-        if query_source == "serverDZ.cfg":
+        if query_source == (
+            "serverDZ.cfg"
+        ):
             query_text = (
                 f"{query_port} "
                 "(serverDZ.cfg)"
             )
+
         else:
             query_text = (
                 f"{query_port} "
@@ -2663,11 +3887,14 @@ class StatusPanel(QWidget):
             "font-size: 14px; font-weight: 600;"
         )
 
-        if status_text == "Not connected":
+        if status_text == (
+            "Not connected"
+        ):
             self.a2s_details_label.setText(
                 "A2S server information will be refreshed "
                 "after reconnecting."
             )
+
         else:
             self.a2s_details_label.setText(
                 "No A2S server information is available."
@@ -2687,6 +3914,8 @@ class StatusPanel(QWidget):
             active_state,
             resource_result,
             a2s_result,
+            fps_result,
+            fps_limit_result,
         ) = result
 
         self._on_a2s_result(
@@ -2697,18 +3926,56 @@ class StatusPanel(QWidget):
             resource_result
         )
 
-        code, out, err = status_result
+        # ------------------------------------------------------------
+        # FPS LIMIT
+        # ------------------------------------------------------------
+        #
+        # The systemd unit is authoritative.
+        #
+        # Only update the graph when the unit was successfully read.
+        # A temporary SSH/read failure therefore does not erase the
+        # last known valid FPS limit.
+        #
+        # If the unit was successfully read and contains no -limitFPS,
+        # the graph is explicitly reset to 0 / Not configured.
+        # ------------------------------------------------------------
+
+        if (
+            fps_limit_result
+            and fps_limit_result.get(
+                "ok"
+            )
+        ):
+            self.history_graph.set_fps_limit(
+                fps_limit_result.get(
+                    "limit_fps",
+                    0,
+                )
+            )
+
+        # Import actual DayZ FPSLogger measurements.
+        self._update_fps_history(
+            fps_result
+        )
+
+        code, out, err = (
+            status_result
+        )
 
         status_lines = []
 
-        for line in (out or "").splitlines():
+        for line in (
+            out or ""
+        ).splitlines():
             if re.match(
                 r"^[A-Z][a-z]{2}\s+\d{2}\s+\d{2}:\d{2}:\d{2}\s+",
                 line,
             ):
                 continue
 
-            status_lines.append(line)
+            status_lines.append(
+                line
+            )
 
         status_text = "\n".join(
             status_lines
@@ -2720,6 +3987,7 @@ class StatusPanel(QWidget):
                     "\n\n"
                     + err.strip()
                 )
+
             else:
                 status_text = err.strip()
 
@@ -2727,7 +3995,9 @@ class StatusPanel(QWidget):
             status_text
         )
 
-        log_code, log_out, log_err = log_result
+        log_code, log_out, log_err = (
+            log_result
+        )
 
         log_text = log_out or ""
 
@@ -2737,10 +4007,13 @@ class StatusPanel(QWidget):
                     "\n\n"
                     + log_err
                 )
+
             else:
                 log_text = log_err
 
-        log_lines = log_text.splitlines()
+        log_lines = (
+            log_text.splitlines()
+        )
 
         filtered_log_lines = []
 
@@ -2758,7 +4031,8 @@ class StatusPanel(QWidget):
 
             if skip_journal_hint:
                 if (
-                    "users in groups" in lowered
+                    "users in groups"
+                    in lowered
                     or "pass -q to turn off this notice"
                     in lowered
                 ):
@@ -2781,7 +4055,9 @@ class StatusPanel(QWidget):
             ):
                 continue
 
-            filtered_log_lines.append(line)
+            filtered_log_lines.append(
+                line
+            )
 
         log_text = "\n".join(
             filtered_log_lines
@@ -2797,7 +4073,9 @@ class StatusPanel(QWidget):
             self.log_output.verticalScrollBar()
         )
 
-        saved_scroll_value = scrollbar.value()
+        saved_scroll_value = (
+            scrollbar.value()
+        )
 
         saved_cursor = (
             self.log_output.textCursor()
@@ -2833,7 +4111,10 @@ class StatusPanel(QWidget):
                 )
 
                 if max_value <= 0:
-                    scrollbar.setValue(0)
+                    scrollbar.setValue(
+                        0
+                    )
+
                 else:
                     scrollbar.setValue(
                         min(
@@ -2917,9 +4198,8 @@ class StatusPanel(QWidget):
                 scroll_log_to_bottom,
             )
 
-        self._update_history_graph(
-            log_text
-        )
+        # Add the current Players/CPU/RAM sample separately from FPS.
+        self._update_history_graph()
 
         state = (
             active_state or "unknown"
@@ -2936,12 +4216,15 @@ class StatusPanel(QWidget):
                 self.status_label.setText(
                     "Running"
                 )
+
             else:
                 self.status_label.setText(
                     "Active"
                 )
 
-            self.lamp.set_state("green")
+            self.lamp.set_state(
+                "green"
+            )
 
         elif state == "inactive":
             self.server_state = "inactive"
@@ -2950,7 +4233,9 @@ class StatusPanel(QWidget):
                 "Stopped"
             )
 
-            self.lamp.set_state("red")
+            self.lamp.set_state(
+                "red"
+            )
 
         elif state == "failed":
             self.server_state = "failed"
@@ -2959,7 +4244,9 @@ class StatusPanel(QWidget):
                 "Failed"
             )
 
-            self.lamp.set_state("red")
+            self.lamp.set_state(
+                "red"
+            )
 
         elif state == "activating":
             self.server_state = "activating"
@@ -2968,7 +4255,9 @@ class StatusPanel(QWidget):
                 "Starting..."
             )
 
-            self.lamp.set_state("amber")
+            self.lamp.set_state(
+                "amber"
+            )
 
         elif state == "deactivating":
             self.server_state = "deactivating"
@@ -2977,7 +4266,9 @@ class StatusPanel(QWidget):
                 "Stopping..."
             )
 
-            self.lamp.set_state("amber")
+            self.lamp.set_state(
+                "amber"
+            )
 
         else:
             self.server_state = "unknown"
@@ -2986,7 +4277,9 @@ class StatusPanel(QWidget):
                 "Unknown"
             )
 
-            self.lamp.set_state("amber")
+            self.lamp.set_state(
+                "amber"
+            )
 
     # ================================================================
     # Log search
@@ -3025,7 +4318,9 @@ class StatusPanel(QWidget):
             self._scroll_log_to_bottom,
         )
 
-    def _scroll_log_to_bottom(self):
+    def _scroll_log_to_bottom(
+        self,
+    ):
         cursor = (
             self.log_output.textCursor()
         )
@@ -3051,7 +4346,9 @@ class StatusPanel(QWidget):
         )
 
     def find_next(self):
-        text = self.log_search_edit.text()
+        text = (
+            self.log_search_edit.text()
+        )
 
         if not text:
             return
@@ -3063,7 +4360,9 @@ class StatusPanel(QWidget):
         )
 
     def find_previous(self):
-        text = self.log_search_edit.text()
+        text = (
+            self.log_search_edit.text()
+        )
 
         if not text:
             return
@@ -3080,9 +4379,13 @@ class StatusPanel(QWidget):
         forward=True,
         wrap=True,
     ):
-        document = self.log_output.document()
+        document = (
+            self.log_output.document()
+        )
 
-        cursor = self.log_output.textCursor()
+        cursor = (
+            self.log_output.textCursor()
+        )
 
         if forward:
             start_position = (
@@ -3192,7 +4495,9 @@ class StatusPanel(QWidget):
             return self.ssh.service_action(
                 self.config.systemd_service,
                 action,
-                sudo_password=password or None,
+                sudo_password=(
+                    password or None
+                ),
             )
 
         self._run(
@@ -3239,8 +4544,12 @@ class StatusPanel(QWidget):
                 self,
                 "Command failed",
                 (
-                    (err or "").strip()
-                    or (out or "").strip()
+                    (
+                        err or ""
+                    ).strip()
+                    or (
+                        out or ""
+                    ).strip()
                     or "Unknown error"
                 )
                 + hint,
@@ -3256,7 +4565,9 @@ class StatusPanel(QWidget):
     # ================================================================
 
     @staticmethod
-    def _shell_quote(value):
+    def _shell_quote(
+        value,
+    ):
         """Quote a string for a POSIX shell command."""
 
         value = str(value)
