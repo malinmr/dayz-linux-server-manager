@@ -1,5 +1,8 @@
 import re
 import shlex
+import time
+
+from PySide6.QtCore import Qt, Signal
 
 from PySide6.QtWidgets import (
     QWidget,
@@ -11,6 +14,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QPlainTextEdit,
     QMessageBox,
+    QDialog,
+    QDialogButtonBox,
 )
 
 from worker import WorkerRegistry
@@ -23,6 +28,76 @@ STEAMCMD_DOWNLOAD_URL = (
     "https://steamcdn-a.akamaihd.net/client/installer/"
     "steamcmd_linux.tar.gz"
 )
+
+# SteamCMD frequently exits 0 even when a step actually failed
+# (e.g. a failed app_update). The exit code alone can't be trusted.
+STEAMCMD_ERROR_PATTERN = re.compile(
+    r"ERROR!",
+    re.IGNORECASE,
+)
+
+# If SteamCMD doesn't have cached credentials for this account on
+# this server yet, +login falls back to interactive prompts for a
+# password and then a Steam Guard code -- as two SEPARATE prompts.
+# But SteamCMD's non-interactive login only accepts the Steam Guard
+# code as a third positional argument on the *same* +login call
+# ("+login user pass code"); it cannot be supplied to a follow-up
+# prompt after the fact, and a Steam Guard code is only valid for a
+# matter of seconds regardless. So instead of trying to answer these
+# prompts one at a time, the moment any of them shows up we cancel
+# that SteamCMD run outright and start a completely fresh one with
+# all three values supplied together.
+LOGIN_NEEDED_PATTERNS = (
+    re.compile(
+        r"cached credentials not found",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^password\s*:\s*$",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+    re.compile(
+        r"steam\s*guard",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"two[- ]factor",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"enter the current code",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"mobile authenticator",
+        re.IGNORECASE,
+    ),
+)
+
+# Maximum number of times to restart SteamCMD with freshly-entered
+# credentials before giving up, as a safety net against a runaway
+# retry loop (e.g. a mistyped password or an expired code keeps
+# getting rejected).
+MAX_LOGIN_ATTEMPTS = 3
+
+# If SteamCMD goes silent for this long mid-command without exiting
+# and without matching one of the patterns above, treat it as a
+# probably-interactive stall too (SteamCMD normally prints frequent
+# progress/keepalive output otherwise).
+STEAMCMD_STALL_TIMEOUT_SECONDS = 30.0
+
+
+class SteamCmdNeedsFreshLoginError(RuntimeError):
+    """
+    Raised when SteamCMD has no cached credentials for this account
+    on this server and is falling back to an interactive prompt.
+
+    This is deliberately not answered in place: SteamCMD only accepts
+    a Steam Guard code as part of the original +login call, not as a
+    reply to a later prompt, and the code expires within seconds
+    anyway. The caller should cancel this run entirely and start a
+    new one with freshly-collected credentials instead.
+    """
 
 
 class DeployPanel(QWidget):
@@ -63,6 +138,22 @@ class DeployPanel(QWidget):
     and the existing daemon is preserved.
     """
 
+    # Emitted from the worker thread while SteamCMD is running so
+    # output can be appended to the log widget safely on the GUI
+    # thread (Qt marshals queued signal emissions across threads
+    # automatically).
+    steamcmd_output = Signal(str)
+
+    # Emitted from the worker thread the moment SteamCMD indicates it
+    # has no cached credentials for this account on this server.
+    # Connected with Qt.BlockingQueuedConnection so emitting this
+    # signal blocks the worker thread until the GUI-thread dialog
+    # closes -- letting us collect (username, password, code) into
+    # self._full_credential_result and read it back immediately after
+    # emit() returns. Must only ever be emitted from a non-GUI thread;
+    # emitting it from the GUI thread would deadlock.
+    credential_dialog_requested = Signal(str, str)
+
     def __init__(
         self,
         ssh,
@@ -79,7 +170,18 @@ class DeployPanel(QWidget):
 
         self.detected_steamcmd = None
 
+        self._full_credential_result = None
+
         self._build_ui()
+
+        self.steamcmd_output.connect(
+            self._append
+        )
+
+        self.credential_dialog_requested.connect(
+            self._show_full_credential_dialog,
+            Qt.ConnectionType.BlockingQueuedConnection,
+        )
 
         self.set_connected(False)
 
@@ -162,7 +264,15 @@ class DeployPanel(QWidget):
             "resolve it through the remote user's PATH.\n\n"
             "DayZ dedicated server files can be downloaded anonymously. "
             "A Steam account is only required if you specifically need "
-            "one for your setup."
+            "one for your setup.\n\n"
+            "If this account has never logged in via SteamCMD on this "
+            "server before, SteamCMD will need a password and/or a "
+            "Steam Guard code. A Steam Guard code expires within "
+            "seconds, so it can't be entered ahead of time here -- "
+            "instead, a popup will appear during deployment at the "
+            "exact moment SteamCMD asks for it. Once SteamCMD has "
+            "cached the login, no further prompts are needed on "
+            "future deployments."
         )
 
         note.setWordWrap(True)
@@ -655,6 +765,17 @@ class DeployPanel(QWidget):
             self.log.appendPlainText(
                 str(text)
             )
+
+    def _append_worker_output(
+        self,
+        text,
+    ):
+        # Safe to call from the worker thread: this only emits a
+        # signal, which Qt queues onto the GUI thread. Never touch
+        # self.log directly from a worker thread.
+        self.steamcmd_output.emit(
+            str(text)
+        )
 
     def _set_busy(self, busy):
         busy = bool(
@@ -2014,6 +2135,480 @@ class DeployPanel(QWidget):
             on_fail=fail,
         )
 
+    @staticmethod
+    def _clean_steamcmd_text(text):
+        """
+        Strip common terminal control sequences from SteamCMD's PTY
+        output while keeping progress text readable.
+        """
+
+        if not text:
+            return ""
+
+        text = str(text)
+
+        text = re.sub(
+            r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])",
+            "",
+            text,
+        )
+
+        text = text.replace("\x00", "")
+        text = text.replace("\x08", "")
+
+        return text
+
+    @staticmethod
+    def _looks_like_login_needed(text):
+        if not text:
+            return False
+
+        return any(
+            pattern.search(text)
+            for pattern in LOGIN_NEEDED_PATTERNS
+        )
+
+    def _show_full_credential_dialog(
+        self,
+        initial_username,
+        message,
+    ):
+        """
+        Runs on the GUI thread via a BlockingQueuedConnection, so the
+        worker thread is paused for the entire duration this dialog
+        is open. Stores the result on self so the worker thread can
+        read it back the instant emit() returns.
+
+        Collects username, password, and Steam Guard code together
+        in one shot, since SteamCMD only accepts the code as part of
+        the original +login call and it expires within seconds --
+        there is no point asking for it separately or in advance.
+        """
+
+        dialog = QDialog(self)
+
+        dialog.setWindowTitle(
+            "Steam Login Required"
+        )
+
+        layout = QVBoxLayout(dialog)
+
+        info_label = QLabel(message)
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        form = QFormLayout()
+
+        username_edit = QLineEdit(
+            initial_username or ""
+        )
+
+        password_edit = QLineEdit()
+        password_edit.setEchoMode(
+            QLineEdit.Password
+        )
+
+        code_edit = QLineEdit()
+        code_edit.setPlaceholderText(
+            "enter the current code now -- it expires in seconds"
+        )
+
+        form.addRow(
+            "Steam username",
+            username_edit,
+        )
+
+        form.addRow(
+            "Steam password",
+            password_edit,
+        )
+
+        form.addRow(
+            "Steam Guard code",
+            code_edit,
+        )
+
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok
+            | QDialogButtonBox.Cancel
+        )
+
+        buttons.accepted.connect(
+            dialog.accept
+        )
+
+        buttons.rejected.connect(
+            dialog.reject
+        )
+
+        layout.addWidget(buttons)
+
+        if initial_username:
+            password_edit.setFocus()
+        else:
+            username_edit.setFocus()
+
+        result = dialog.exec()
+
+        if result != QDialog.Accepted:
+            self._full_credential_result = None
+            return
+
+        username = username_edit.text().strip()
+        password = password_edit.text().strip()
+        code = code_edit.text().strip()
+
+        if not username or not password or not code:
+            QMessageBox.warning(
+                self,
+                "Missing Information",
+                "Steam username, password, and the current Steam "
+                "Guard code are all required to log in.",
+            )
+
+            self._full_credential_result = None
+            return
+
+        self._full_credential_result = (
+            username,
+            password,
+            code,
+        )
+
+    def _request_full_credentials(
+        self,
+        initial_username,
+        message,
+    ):
+        """
+        Must only be called from a worker thread. Blocks that thread
+        until the user submits (or cancels) the dialog on the GUI
+        thread, then returns an (username, password, code) tuple, or
+        None if cancelled/incomplete.
+        """
+
+        self._full_credential_result = None
+
+        self.credential_dialog_requested.emit(
+            initial_username or "",
+            message,
+        )
+
+        return self._full_credential_result
+
+    def _emit_deploy_chunk(
+        self,
+        buffer,
+        data,
+        stream_name,
+        error_lines,
+    ):
+        """
+        Process one chunk of live SteamCMD output: stream completed
+        lines to the log and collect any ERROR! lines.
+
+        Returns the unconsumed remainder (a line still being
+        received, with no trailing newline yet).
+        """
+
+        if data:
+            buffer += data
+
+        buffer = buffer.replace("\r\n", "\n")
+        buffer = buffer.replace("\r", "\n")
+
+        parts = buffer.split("\n")
+        complete = parts[:-1]
+        remainder = parts[-1]
+
+        for line in complete:
+            line = self._clean_steamcmd_text(
+                line
+            ).strip()
+
+            if not line:
+                continue
+
+            if STEAMCMD_ERROR_PATTERN.search(
+                line
+            ):
+                error_lines.append(
+                    line
+                )
+
+            if stream_name == "stderr":
+                self._append_worker_output(
+                    f"[SteamCMD STDERR] {line}"
+                )
+            else:
+                self._append_worker_output(
+                    line
+                )
+
+        return remainder
+
+    def _run_steamcmd_deploy_live(
+        self,
+        command,
+    ):
+        """
+        Run a SteamCMD command over a live, PTY-backed SSH channel,
+        streaming output as it arrives.
+
+        The moment SteamCMD indicates it has no cached credentials
+        for this account on this server (an explicit "Cached
+        credentials not found." message, or a bare password/Steam
+        Guard prompt), this run is cancelled immediately by closing
+        the channel -- which kills the remote SteamCMD process -- and
+        SteamCmdNeedsFreshLoginError is raised. SteamCMD only accepts
+        a Steam Guard code as part of the original +login call, not
+        as a reply to a later prompt, and the code expires within
+        seconds anyway, so there is no point trying to answer these
+        prompts in place. The caller is expected to collect fresh
+        credentials and start an entirely new run.
+
+        If SteamCMD goes silent for an extended period without
+        exiting and without matching a recognized pattern, that is
+        treated the same way, in case of a prompt-text variant we
+        don't otherwise recognize.
+
+        Also treats an explicit "ERROR!" line as a hard failure even
+        if SteamCMD's own exit code comes back 0, since SteamCMD is
+        known to do that for a failed app_update/login too.
+
+        Returns the process exit code on success.
+        """
+
+        self._append_worker_output(
+            "$ " + command
+        )
+
+        if self.ssh.client is None:
+            raise RuntimeError(
+                "SSH connection is not available."
+            )
+
+        transport = (
+            self.ssh.client.get_transport()
+        )
+
+        if (
+            transport is None
+            or not transport.is_active()
+        ):
+            raise RuntimeError(
+                "SSH connection is not active."
+            )
+
+        channel = transport.open_session()
+
+        try:
+            try:
+                channel.get_pty(
+                    term="xterm",
+                    width=160,
+                    height=40,
+                )
+            except Exception:
+                # Some SSH servers may reject PTY allocation; plain
+                # channel output still works without one.
+                pass
+
+            channel.exec_command(
+                command
+            )
+
+            stdout_buffer = ""
+            stderr_buffer = ""
+            error_lines = []
+
+            last_output_time = time.monotonic()
+
+            while True:
+                had_data = False
+
+                if channel.recv_ready():
+                    data = channel.recv(
+                        8192
+                    )
+
+                    if data:
+                        had_data = True
+
+                        text = data.decode(
+                            "utf-8",
+                            errors="replace",
+                        )
+
+                        stdout_buffer = (
+                            self._emit_deploy_chunk(
+                                stdout_buffer,
+                                text,
+                                "stdout",
+                                error_lines,
+                            )
+                        )
+
+                        last_output_time = (
+                            time.monotonic()
+                        )
+
+                if channel.recv_stderr_ready():
+                    data = channel.recv_stderr(
+                        8192
+                    )
+
+                    if data:
+                        had_data = True
+
+                        text = data.decode(
+                            "utf-8",
+                            errors="replace",
+                        )
+
+                        stderr_buffer = (
+                            self._emit_deploy_chunk(
+                                stderr_buffer,
+                                text,
+                                "stderr",
+                                error_lines,
+                            )
+                        )
+
+                        last_output_time = (
+                            time.monotonic()
+                        )
+
+                # A login prompt normally has no trailing newline
+                # (e.g. "password: " sits waiting right after the
+                # colon), so check both remainders every pass, not
+                # just completed lines.
+                for remainder in (
+                    stdout_buffer,
+                    stderr_buffer,
+                ):
+                    cleaned_remainder = (
+                        self._clean_steamcmd_text(
+                            remainder
+                        ).strip()
+                    )
+
+                    if self._looks_like_login_needed(
+                        cleaned_remainder
+                    ):
+                        self._append_worker_output(
+                            cleaned_remainder
+                        )
+
+                        raise SteamCmdNeedsFreshLoginError(
+                            cleaned_remainder
+                        )
+
+                if channel.exit_status_ready():
+                    if not (
+                        channel.recv_ready()
+                        or channel.recv_stderr_ready()
+                    ):
+                        break
+
+                if not had_data:
+                    stalled_for = (
+                        time.monotonic()
+                        - last_output_time
+                    )
+
+                    if (
+                        not channel.exit_status_ready()
+                        and stalled_for
+                        > STEAMCMD_STALL_TIMEOUT_SECONDS
+                    ):
+                        raise SteamCmdNeedsFreshLoginError(
+                            "SteamCMD has produced no output for "
+                            f"{int(STEAMCMD_STALL_TIMEOUT_SECONDS)} "
+                            "seconds without exiting, which almost "
+                            "always means it's waiting on "
+                            "interactive input."
+                        )
+
+                    time.sleep(0.05)
+
+            if stdout_buffer:
+                stdout_buffer = self._clean_steamcmd_text(
+                    stdout_buffer
+                ).strip()
+
+                if stdout_buffer:
+                    if STEAMCMD_ERROR_PATTERN.search(
+                        stdout_buffer
+                    ):
+                        error_lines.append(
+                            stdout_buffer
+                        )
+
+                    self._append_worker_output(
+                        stdout_buffer
+                    )
+
+            if stderr_buffer:
+                stderr_buffer = self._clean_steamcmd_text(
+                    stderr_buffer
+                ).strip()
+
+                if stderr_buffer:
+                    if STEAMCMD_ERROR_PATTERN.search(
+                        stderr_buffer
+                    ):
+                        error_lines.append(
+                            stderr_buffer
+                        )
+
+                    self._append_worker_output(
+                        f"[SteamCMD STDERR] {stderr_buffer}"
+                    )
+
+            exit_code = (
+                channel.recv_exit_status()
+            )
+
+            if exit_code == 0:
+                self._append_worker_output(
+                    "SteamCMD finished successfully."
+                )
+            else:
+                self._append_worker_output(
+                    f"SteamCMD FAILED with exit code {exit_code}."
+                )
+
+            if error_lines:
+                self._append_worker_output(
+                    "SteamCMD reported at least one error line "
+                    "despite the process exit code:"
+                )
+
+                for line in error_lines:
+                    self._append_worker_output(
+                        f"  {line}"
+                    )
+
+                raise RuntimeError(
+                    "SteamCMD reported a failure even though it "
+                    f"exited with code {exit_code}:\n"
+                    + "\n".join(error_lines)
+                )
+
+            return exit_code
+
+        finally:
+            # Closing the channel while SteamCMD is still running
+            # (e.g. right after detecting a login-needed condition)
+            # terminates the remote SteamCMD process along with it.
+            try:
+                channel.close()
+            except Exception:
+                pass
+
     def _install_server_with_detected_steamcmd(
         self,
         detected,
@@ -2065,15 +2660,6 @@ class DeployPanel(QWidget):
         # the systemd deployment code.
         # ----------------------------------------------------
 
-        login_part = (
-            f"+login {shlex.quote(steam_user)}"
-        )
-
-        if steam_password:
-            login_part += (
-                f" {shlex.quote(steam_password)}"
-            )
-
         server_root = server_root.rstrip("/")
 
         steamcmd = shlex.quote(
@@ -2084,15 +2670,34 @@ class DeployPanel(QWidget):
             server_root
         )
 
-        cmd = (
-            f"mkdir -p {quoted_root} && "
-            f"cd {quoted_root} && "
-            f"{steamcmd} "
-            f"+force_install_dir {quoted_root} "
-            f"{login_part} "
-            f"+app_update {shlex.quote(str(appid))} validate "
-            f"+quit"
-        )
+        def build_cmd(
+            current_user,
+            current_password,
+            current_code,
+        ):
+            login_part = (
+                f"+login {shlex.quote(current_user)}"
+            )
+
+            if current_password:
+                login_part += (
+                    f" {shlex.quote(current_password)}"
+                )
+
+                if current_code:
+                    login_part += (
+                        f" {shlex.quote(current_code)}"
+                    )
+
+            return (
+                f"mkdir -p {quoted_root} && "
+                f"cd {quoted_root} && "
+                f"{steamcmd} "
+                f"+force_install_dir {quoted_root} "
+                f"{login_part} "
+                f"+app_update {shlex.quote(str(appid))} validate "
+                f"+quit"
+            )
 
         # IMPORTANT:
         # This GUI update must happen before the worker starts.
@@ -2103,12 +2708,102 @@ class DeployPanel(QWidget):
         )
 
         def task():
-            result = self.ssh.exec(
-                cmd,
-                timeout=3600,
-            )
+            current_user = steam_user
+            current_password = steam_password
+            current_code = None
 
-            code, output, error = result
+            attempt = 0
+            code = None
+            error = ""
+
+            while True:
+                cmd = build_cmd(
+                    current_user,
+                    current_password,
+                    current_code,
+                )
+
+                try:
+                    code = self._run_steamcmd_deploy_live(
+                        cmd
+                    )
+
+                    error = ""
+
+                    break
+
+                except SteamCmdNeedsFreshLoginError as exc:
+                    attempt += 1
+
+                    self._append_worker_output(
+                        "SteamCMD has no cached login for this "
+                        "account on this server -- cancelling this "
+                        "run and asking for fresh credentials."
+                    )
+
+                    if attempt > MAX_LOGIN_ATTEMPTS:
+                        code = 1
+
+                        error = (
+                            "SteamCMD still could not log in after "
+                            f"{MAX_LOGIN_ATTEMPTS} attempt(s) with "
+                            "freshly-entered credentials. "
+                            "Double-check the account name, "
+                            "password, and Steam Guard code.\n\n"
+                            f"Last message from SteamCMD: {exc}"
+                        )
+
+                        break
+
+                    creds = (
+                        self._request_full_credentials(
+                            current_user,
+                            (
+                                "SteamCMD has no cached credentials "
+                                "for this account on this server, "
+                                "so it needs your password and a "
+                                "current Steam Guard code.\n\n"
+                                "All three are sent to SteamCMD "
+                                "together the moment you click OK, "
+                                "since the code is only valid for a "
+                                "few seconds -- have your "
+                                "authenticator ready before "
+                                "confirming."
+                            ),
+                        )
+                    )
+
+                    if creds is None:
+                        code = 1
+
+                        error = (
+                            "Deployment cancelled: SteamCMD needed "
+                            "fresh credentials and none were "
+                            "provided."
+                        )
+
+                        break
+
+                    (
+                        current_user,
+                        current_password,
+                        current_code,
+                    ) = creds
+
+                except RuntimeError as exc:
+                    # Any other detected failure (an explicit
+                    # ERROR! line, a lost connection, etc). Surface
+                    # it as a normal SteamCMD failure rather than
+                    # letting the whole job fail with a traceback --
+                    # the message is already user-actionable.
+                    code = 1
+                    error = str(exc)
+                    break
+
+            # Output has already been streamed live via
+            # _append_worker_output, so there's nothing further to
+            # hand back here.
+            output = ""
 
             # ------------------------------------------------
             # Verify that SteamCMD actually created the
@@ -2170,8 +2865,8 @@ class DeployPanel(QWidget):
 
             return {
                 "steamcmd_code": code,
-                "steamcmd_output": output or "",
-                "steamcmd_error": error or "",
+                "steamcmd_output": output,
+                "steamcmd_error": error,
                 "verify_code": verify_code,
                 "verify_output": verify_output or "",
                 "verify_error": verify_error or "",
