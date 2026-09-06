@@ -107,6 +107,8 @@ PySide6 is available under the GNU LGPLv3 and GPLv3, subject to the applicable Q
 
 See the [Qt for Python licensing documentation](https://doc.qt.io/qtforpython-6/licenses.html) for more information.
 
+[Heatmap](https://steamcommunity.com/sharedfiles/filedetails/?id=2854246756) by affenb3rt is also included in this project.
+
 ## Contributing
 
 Contributions, bug reports, feature requests, and pull requests are welcome.
