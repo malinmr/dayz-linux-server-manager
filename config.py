@@ -68,6 +68,20 @@ class AppConfig:
         "/home/dayz/server/profiles"
     )
 
+    # ========================================================
+    # DAYZ FPS LIMIT
+    # ========================================================
+    #
+    # This stores the actual -limitFPS= value from the
+    # systemd ExecStart configuration.
+    #
+    # 0 means no -limitFPS value is configured.
+    #
+    # StatusPanel uses this value as the 100% reference
+    # for the server FPS history graph.
+
+    limit_fps: int = 0
+
     # Server-root-derived directories.
 
     keys_dir: str = (
@@ -221,6 +235,9 @@ class AppConfig:
         server_root.
 
         An absolute profiles_arg is used directly.
+
+        limit_fps is intentionally NOT derived here because
+        it comes from the systemd -limitFPS parameter.
         """
 
         root = (
@@ -279,6 +296,24 @@ class AppConfig:
         self.profiles_dir = profiles_dir
         self.log_dir = profiles_dir
 
+        # ----------------------------------------------------
+        # FPS LIMIT
+        # ----------------------------------------------------
+        #
+        # Keep this as a clean integer.
+        #
+        # 0 means no -limitFPS value is configured.
+
+        try:
+            self.limit_fps = int(
+                self.limit_fps
+            )
+        except (TypeError, ValueError):
+            self.limit_fps = 0
+
+        if self.limit_fps < 0:
+            self.limit_fps = 0
+
     # ========================================================
     # CONFIGURATION STATUS
     # ========================================================
@@ -306,6 +341,8 @@ class AppConfig:
         Server-root-derived paths and the resolved profiles
         directory are refreshed before saving so the stored
         configuration remains internally consistent.
+
+        limit_fps is also normalized before saving.
         """
 
         self.update_server_paths()
@@ -340,6 +377,9 @@ class AppConfig:
 
         Older configuration files may not contain profiles_arg.
         The default value "profiles" is then used.
+
+        Older configuration files may not contain limit_fps.
+        The default value 0 is then used.
 
         Older configuration files may not contain
         marked_wipe_files. The default empty list is then used.
@@ -380,6 +420,9 @@ class AppConfig:
                 # profiles_dir is also resolved here from
                 # profiles_arg so the stored -profiles=
                 # parameter remains authoritative.
+                #
+                # limit_fps is preserved because it represents
+                # the configured systemd -limitFPS value.
 
                 config.update_server_paths()
 
