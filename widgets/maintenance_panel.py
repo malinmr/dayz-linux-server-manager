@@ -754,7 +754,23 @@ class MaintenanceOperation:
                 path,
                 "r",
             ) as remote_file:
-                return remote_file.read()
+                data = remote_file.read()
+
+            # paramiko's SFTP file objects always hand back bytes,
+            # regardless of the "r" mode passed to open() -- there is
+            # no text-mode decoding at the SFTP layer. Every caller
+            # here (regex matching, string slicing, "in" checks)
+            # expects str, so decode once, centrally, right here.
+            if isinstance(
+                data,
+                bytes,
+            ):
+                data = data.decode(
+                    "utf-8-sig",
+                    errors="replace",
+                )
+
+            return data
 
         finally:
             if sftp:
@@ -772,6 +788,17 @@ class MaintenanceOperation:
 
         try:
             sftp = self._sftp()
+
+            # Mirror _read_remote_file: callers build up str content
+            # (regex/slicing results), but paramiko's SFTP file
+            # objects require bytes to write.
+            if isinstance(
+                content,
+                str,
+            ):
+                content = content.encode(
+                    "utf-8"
+                )
 
             with sftp.open(
                 path,
@@ -843,6 +870,59 @@ class MaintenanceOperation:
             / "serverDZ.cfg"
         )
 
+    def _extract_braced_block(
+        self,
+        text,
+        class_name,
+    ):
+        """
+        Find `class <class_name> { ... }` in `text` and return the
+        content between the matching braces.
+
+        A lazy regex like `\\{(.*?)\\}` cannot be used here: it stops
+        at the *nearest* closing brace, not the one that actually
+        matches the opening brace. serverDZ.cfg nests classes (e.g.
+        `class DayZ { ... };` inside `class Missions { ... };`), so
+        the nearest `}` usually belongs to an inner block, not the
+        one we're looking for. Braces have to be counted instead.
+        """
+
+        header_match = re.search(
+            r"class\s+"
+            + re.escape(
+                class_name
+            )
+            + r"\s*\{",
+            text,
+            re.IGNORECASE,
+        )
+
+        if not header_match:
+            return None
+
+        depth = 1
+        index = header_match.end()
+
+        while index < len(text):
+            char = text[index]
+
+            if char == "{":
+                depth += 1
+
+            elif char == "}":
+                depth -= 1
+
+                if depth == 0:
+                    return text[
+                        header_match.end() : index
+                    ]
+
+            index += 1
+
+        # Reached the end of the text without the brace ever
+        # balancing back out -- the file is malformed/truncated.
+        return None
+
     def _extract_active_mission(
         self,
         config_text,
@@ -861,43 +941,31 @@ class MaintenanceOperation:
         from serverDZ.cfg.
         """
 
-        missions_match = re.search(
-            r"class\s+Missions\s*\{"
-            r"(?P<body>.*?)"
-            r"\}",
-            config_text,
-            re.IGNORECASE
-            | re.DOTALL,
+        missions_body = (
+            self._extract_braced_block(
+                config_text,
+                "Missions",
+            )
         )
 
-        if not missions_match:
+        if missions_body is None:
             raise RuntimeError(
                 "Could not find 'class Missions' "
                 "in serverDZ.cfg."
             )
 
-        missions_body = (
-            missions_match.group("body")
+        dayz_body = (
+            self._extract_braced_block(
+                missions_body,
+                "DayZ",
+            )
         )
 
-        dayz_match = re.search(
-            r"class\s+DayZ\s*\{"
-            r"(?P<body>.*?)"
-            r"\}",
-            missions_body,
-            re.IGNORECASE
-            | re.DOTALL,
-        )
-
-        if not dayz_match:
+        if dayz_body is None:
             raise RuntimeError(
                 "Could not find 'class DayZ' "
                 "inside class Missions."
             )
-
-        dayz_body = (
-            dayz_match.group("body")
-        )
 
         template_match = re.search(
             r"\btemplate\s*=\s*"

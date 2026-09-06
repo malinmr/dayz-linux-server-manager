@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -512,9 +513,6 @@ class ModsPanel(QWidget):
             search_group
         )
 
-        # The preview is deliberately placed on the LEFT while the
-        # original Workshop browser remains on the RIGHT and gets the
-        # majority of the available width.
         search_body = QHBoxLayout()
 
         # ----------------------------------------------------------
@@ -706,8 +704,6 @@ class ModsPanel(QWidget):
             use_row
         )
 
-        # Preview gets a controlled width.
-        # Browser gets the remaining width.
         search_body.addWidget(
             preview_group,
             0,
@@ -945,6 +941,14 @@ class ModsPanel(QWidget):
             self.check_mod_updates
         )
 
+        self.update_selected_button = QPushButton(
+            "Update Selected Mod"
+        )
+
+        self.update_selected_button.clicked.connect(
+            self.update_selected_mod
+        )
+
         self.resync_keys_button = QPushButton(
             "Re-sync Keys for Selected"
         )
@@ -982,6 +986,10 @@ class ModsPanel(QWidget):
         )
 
         button_row.addWidget(
+            self.update_selected_button
+        )
+
+        button_row.addWidget(
             self.resync_keys_button
         )
 
@@ -999,10 +1007,6 @@ class ModsPanel(QWidget):
 
         installed_layout.addLayout(
             button_row
-        )
-
-        root.addWidget(
-            installed_group
         )
 
         # --------------------------------------------------------------
@@ -1027,8 +1031,55 @@ class ModsPanel(QWidget):
             self.log_box
         )
 
-        root.addWidget(
+        # --------------------------------------------------------------
+        # Resizable Installed Mods / Log Splitter
+        # --------------------------------------------------------------
+
+        self.mods_log_splitter = QSplitter(
+            Qt.Vertical
+        )
+
+        self.mods_log_splitter.setChildrenCollapsible(
+            False
+        )
+
+        installed_group.setMinimumHeight(
+            220
+        )
+
+        log_group.setMinimumHeight(
+            100
+        )
+
+        self.mods_log_splitter.addWidget(
+            installed_group
+        )
+
+        self.mods_log_splitter.addWidget(
             log_group
+        )
+
+        # Give the installed-mod panel considerably more space.
+        self.mods_log_splitter.setStretchFactor(
+            0,
+            4,
+        )
+
+        self.mods_log_splitter.setStretchFactor(
+            1,
+            1,
+        )
+
+        self.mods_log_splitter.setSizes(
+            [
+                500,
+                180,
+            ]
+        )
+
+        root.addWidget(
+            self.mods_log_splitter,
+            1,
         )
 
     # ==============================================================
@@ -1399,8 +1450,6 @@ class ModsPanel(QWidget):
             connected
         )
 
-        was_connected = self._connected
-
         self._connected = connected
 
         self.search_edit.setEnabled(
@@ -1447,6 +1496,10 @@ class ModsPanel(QWidget):
             connected
         )
 
+        self.update_selected_button.setEnabled(
+            connected
+        )
+
         self.resync_keys_button.setEnabled(
             connected
         )
@@ -1459,21 +1512,18 @@ class ModsPanel(QWidget):
             True
         )
 
-        if connected and not was_connected:
+        # IMPORTANT:
+        # Do not automatically check Workshop updates here.
+        # Update checks are now only performed when the user
+        # presses "Check Mod Updates".
+
+        if connected:
             self._append_log(
                 "SSH connection established. "
                 "Refreshing mod Key/Symlink status..."
             )
 
             self._refresh_installed_table()
-
-            self._append_log(
-                "Checking Workshop mod update status..."
-            )
-
-            self.check_mod_updates(
-                silent=True
-            )
 
     # ==============================================================
     # Logging
@@ -1904,13 +1954,6 @@ class ModsPanel(QWidget):
         content,
         key,
     ):
-        """
-        Extract a complete KeyValues block for the specified key.
-
-        Steam ACF files can contain nested braces, so simply searching
-        until the next '}' is not reliable.
-        """
-
         pattern = re.compile(
             rf'"{re.escape(str(key))}"\s*\{{',
             re.MULTILINE,
@@ -1974,13 +2017,6 @@ class ModsPanel(QWidget):
         content,
         workshop_id,
     ):
-        """
-        Find every ACF block for the requested Workshop ID.
-
-        The same Workshop ID may appear in multiple sections of the
-        appworkshop_221100.acf file.
-        """
-
         workshop_id = str(
             workshop_id
         ).strip()
@@ -2053,14 +2089,6 @@ class ModsPanel(QWidget):
         content,
         workshop_id,
     ):
-        """
-        Return the Workshop ID block containing timeupdated.
-
-        Steam's ACF may contain the same Workshop ID multiple times.
-        The old implementation only checked the first occurrence,
-        which caused some older installed mods to show UNKNOWN.
-        """
-
         blocks = (
             self._extract_all_workshop_item_blocks(
                 content,
@@ -2071,7 +2099,6 @@ class ModsPanel(QWidget):
         if not blocks:
             return None
 
-        # Best case: a block containing timeupdated.
         for block in blocks:
             if re.search(
                 r'"timeupdated"\s+"?([0-9]+)"?',
@@ -2080,7 +2107,6 @@ class ModsPanel(QWidget):
             ):
                 return block
 
-        # Second choice: a block containing a manifest.
         for block in blocks:
             if re.search(
                 r'"manifest"\s+"?([0-9]+)"?',
@@ -2095,12 +2121,6 @@ class ModsPanel(QWidget):
         self,
         workshop_id,
     ):
-        """
-        Read local Steam Workshop metadata from:
-
-            steamapps/workshop/appworkshop_221100.acf
-        """
-
         manifest_path = (
             self._workshop_manifest_path()
         )
@@ -2213,10 +2233,6 @@ class ModsPanel(QWidget):
         workshop_id,
         api_key,
     ):
-        """
-        Get the current Steam Workshop update timestamp.
-        """
-
         details = steam_web_api.get_details(
             api_key,
             workshop_id,
@@ -2282,10 +2298,6 @@ class ModsPanel(QWidget):
                 "remote_time": None,
             }
 
-        # ----------------------------------------------------------
-        # Check the actual Workshop content directory.
-        # ----------------------------------------------------------
-
         workshop_path = (
             self._find_remote_workshop_item(
                 workshop_id
@@ -2303,10 +2315,6 @@ class ModsPanel(QWidget):
                 "local_time": None,
                 "remote_time": None,
             }
-
-        # ----------------------------------------------------------
-        # Read local Workshop metadata.
-        # ----------------------------------------------------------
 
         local_metadata = (
             self._read_local_workshop_metadata(
@@ -2331,10 +2339,6 @@ class ModsPanel(QWidget):
                 "timeupdated"
             )
         )
-
-        # ----------------------------------------------------------
-        # Get current Steam Workshop timestamp.
-        # ----------------------------------------------------------
 
         remote_time = (
             self._get_remote_workshop_update_time(
@@ -2361,10 +2365,6 @@ class ModsPanel(QWidget):
                 "local_time": None,
                 "remote_time": remote_time,
             }
-
-        # ----------------------------------------------------------
-        # Compare timestamps.
-        # ----------------------------------------------------------
 
         self._append_worker_output(
             f"{workshop_id}: "
@@ -2440,7 +2440,6 @@ class ModsPanel(QWidget):
             False
         )
 
-        # Show that a fresh check is running.
         for mod in mods:
             mod["update_status"] = "checking"
 
@@ -2621,7 +2620,6 @@ class ModsPanel(QWidget):
                 self._connected
             )
 
-            # Don't leave rows stuck on CHECKING.
             for mod in self.config.mods:
                 if (
                     mod.get("update_status")
@@ -2755,6 +2753,32 @@ class ModsPanel(QWidget):
             )
         }
 
+    def _find_key_file_for_name(
+        self,
+        workshop_id,
+        key_name,
+    ):
+        """
+        Return the full remote path to a key file with this exact
+        filename inside the given mod's own Workshop folder, or None
+        if that mod does not carry its own copy (e.g. it merely
+        relies on another mod's shared key).
+        """
+
+        for key_file in self._get_mod_key_files(
+            workshop_id
+        ):
+            if (
+                key_file.rsplit(
+                    "/",
+                    1,
+                )[-1]
+                == key_name
+            ):
+                return key_file
+
+        return None
+
     # ==============================================================
     # Shared key protection
     # ==============================================================
@@ -2824,6 +2848,121 @@ class ModsPanel(QWidget):
 
         return users
 
+    def _repair_shared_key_symlink(
+        self,
+        destination,
+        key_name,
+        removed_workshop_path,
+        surviving_workshop_ids,
+    ):
+        """
+        A key is being kept because another enabled mod also carries
+        a copy of it. But the *existing* symlink at `destination` may
+        still be pointing at the copy that lives inside the mod we
+        are about to delete -- if so, it will dangle the moment that
+        mod's Workshop folder is removed, even though a perfectly
+        good copy still exists elsewhere. Detect that and repoint the
+        symlink at a surviving mod's copy before that happens.
+        """
+
+        code, out, err = (
+            self.ssh.exec(
+                "if [ -L "
+                + shlex.quote(
+                    destination
+                )
+                + " ]; then readlink -f "
+                + shlex.quote(
+                    destination
+                )
+                + "; fi"
+            )
+        )
+
+        current_target = (
+            out.strip()
+            if code == 0
+            else ""
+        )
+
+        if not current_target:
+            # Not currently a symlink (or unreadable) -- nothing of
+            # ours to repair here.
+            return
+
+        removed_prefix = (
+            removed_workshop_path.rstrip(
+                "/"
+            )
+            + "/"
+        )
+
+        points_into_removed_mod = (
+            current_target
+            == removed_workshop_path.rstrip(
+                "/"
+            )
+            or current_target.startswith(
+                removed_prefix
+            )
+        )
+
+        if not points_into_removed_mod:
+            # Already pointing at a copy outside the mod being
+            # removed -- nothing to do.
+            return
+
+        replacement = None
+
+        for candidate_id in surviving_workshop_ids:
+            replacement = (
+                self._find_key_file_for_name(
+                    candidate_id,
+                    key_name,
+                )
+            )
+
+            if replacement:
+                break
+
+        if not replacement:
+            self._append_worker_output(
+                f"WARNING: {key_name} was reported as shared, but "
+                "no surviving mod actually has its own copy of the "
+                "file. The key link may be left dangling -- check "
+                f"{destination} manually."
+            )
+
+            return
+
+        code, out, err = (
+            self.ssh.exec(
+                "rm -f "
+                + shlex.quote(
+                    destination
+                )
+                + " && ln -s "
+                + shlex.quote(
+                    replacement
+                )
+                + " "
+                + shlex.quote(
+                    destination
+                )
+            )
+        )
+
+        if code != 0:
+            raise RuntimeError(
+                f"Failed to relink shared key {key_name} onto a "
+                f"surviving copy:\n{err}"
+            )
+
+        self._append_worker_output(
+            f"Relinked shared key {key_name} -> {replacement} "
+            "(previous copy is being removed with its mod)."
+        )
+
     def _remove_unused_keys(
         self,
         workshop_id,
@@ -2835,6 +2974,12 @@ class ModsPanel(QWidget):
 
         if not keys_dir:
             return
+
+        removed_workshop_path = (
+            self._workshop_path(
+                workshop_id
+            )
+        )
 
         for key_file in key_files:
             key_name = key_file.rsplit(
@@ -2855,6 +3000,13 @@ class ModsPanel(QWidget):
             )
 
             if users:
+                self._repair_shared_key_symlink(
+                    destination,
+                    key_name,
+                    removed_workshop_path,
+                    users,
+                )
+
                 self._append_worker_output(
                     f"Keeping shared key {key_name}; "
                     f"still used by: "
@@ -3505,6 +3657,92 @@ class ModsPanel(QWidget):
     # SteamCMD
     # ==============================================================
 
+    @staticmethod
+    def _clean_steamcmd_text(text):
+        """
+        Clean common SteamCMD terminal control sequences while
+        keeping useful progress output readable.
+        """
+
+        if not text:
+            return ""
+
+        text = str(text)
+
+        # Remove ANSI CSI escape sequences.
+        text = re.sub(
+            r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])",
+            "",
+            text,
+        )
+
+        # Remove other common terminal control characters.
+        text = text.replace(
+            "\x00",
+            "",
+        )
+
+        text = text.replace(
+            "\x08",
+            "",
+        )
+
+        return text
+
+    def _emit_steamcmd_chunk(
+        self,
+        buffer,
+        data,
+        stream_name,
+    ):
+        """
+        Consume a SteamCMD output chunk.
+
+        SteamCMD frequently uses carriage returns for progress
+        updates rather than newline characters. Treat each carriage
+        return as a logical output boundary so progress is visible in
+        the GUI console.
+        """
+
+        if data:
+            buffer += data
+
+        buffer = buffer.replace(
+            "\r\n",
+            "\n",
+        )
+
+        buffer = buffer.replace(
+            "\r",
+            "\n",
+        )
+
+        parts = buffer.split(
+            "\n"
+        )
+
+        complete = parts[:-1]
+        remainder = parts[-1]
+
+        for line in complete:
+            line = self._clean_steamcmd_text(
+                line
+            ).strip()
+
+            if not line:
+                continue
+
+            if stream_name == "stderr":
+                self._append_worker_output(
+                    f"[SteamCMD STDERR] {line}"
+                )
+            else:
+                self._append_worker_output(
+                    line
+                )
+
+        return remainder
+
     def _run_steamcmd_live(
         self,
         steamcmd_path,
@@ -3513,7 +3751,31 @@ class ModsPanel(QWidget):
         workshop_id,
     ):
         self._append_worker_output(
-            "Starting SteamCMD..."
+            ""
+        )
+
+        self._append_worker_output(
+            "=================================================="
+        )
+
+        self._append_worker_output(
+            f"SteamCMD download starting: Workshop ID {workshop_id}"
+        )
+
+        self._append_worker_output(
+            f"SteamCMD path: {steamcmd_path}"
+        )
+
+        self._append_worker_output(
+            f"Install directory: {server_root}"
+        )
+
+        self._append_worker_output(
+            f"Steam account: {steam_user}"
+        )
+
+        self._append_worker_output(
+            "=================================================="
         )
 
         command = (
@@ -3552,78 +3814,129 @@ class ModsPanel(QWidget):
         channel = transport.open_session()
 
         try:
+            # A PTY makes SteamCMD behave more like it does in a
+            # real console and greatly improves progress output.
+            try:
+                channel.get_pty(
+                    term="xterm",
+                    width=160,
+                    height=40,
+                )
+            except Exception:
+                # Some SSH servers may reject PTY allocation.
+                # Normal channel output still works without it.
+                pass
+
             channel.exec_command(
                 command
             )
 
-            buffer = ""
+            stdout_buffer = ""
+            stderr_buffer = ""
+
+            last_output_time = time.monotonic()
 
             while True:
+                had_data = False
+
                 if channel.recv_ready():
                     data = channel.recv(
-                        4096
+                        8192
                     )
 
                     if data:
+                        had_data = True
+
                         text = data.decode(
                             "utf-8",
                             errors="replace",
                         )
 
-                        buffer += text
-
-                        lines = buffer.splitlines(
-                            keepends=True
+                        stdout_buffer = (
+                            self._emit_steamcmd_chunk(
+                                stdout_buffer,
+                                text,
+                                "stdout",
+                            )
                         )
 
-                        buffer = ""
-
-                        for line in lines:
-                            if line.endswith(
-                                ("\n", "\r")
-                            ):
-                                self._append_worker_output(
-                                    line.rstrip()
-                                )
-                            else:
-                                buffer += line
+                        last_output_time = (
+                            time.monotonic()
+                        )
 
                 if channel.recv_stderr_ready():
                     data = channel.recv_stderr(
-                        4096
+                        8192
                     )
 
                     if data:
+                        had_data = True
+
                         text = data.decode(
                             "utf-8",
                             errors="replace",
                         )
 
-                        for line in text.splitlines():
-                            self._append_worker_output(
-                                line
+                        stderr_buffer = (
+                            self._emit_steamcmd_chunk(
+                                stderr_buffer,
+                                text,
+                                "stderr",
                             )
+                        )
+
+                        last_output_time = (
+                            time.monotonic()
+                        )
 
                 if channel.exit_status_ready():
-                    break
+                    # Drain any data that arrived just before the
+                    # exit status became available.
+                    if not (
+                        channel.recv_ready()
+                        or channel.recv_stderr_ready()
+                    ):
+                        break
 
-                time.sleep(
-                    0.05
-                )
+                if not had_data:
+                    time.sleep(
+                        0.05
+                    )
 
-            if buffer:
-                self._append_worker_output(
-                    buffer.rstrip()
-                )
+            if stdout_buffer:
+                stdout_buffer = self._clean_steamcmd_text(
+                    stdout_buffer
+                ).strip()
+
+                if stdout_buffer:
+                    self._append_worker_output(
+                        stdout_buffer
+                    )
+
+            if stderr_buffer:
+                stderr_buffer = self._clean_steamcmd_text(
+                    stderr_buffer
+                ).strip()
+
+                if stderr_buffer:
+                    self._append_worker_output(
+                        f"[SteamCMD STDERR] "
+                        f"{stderr_buffer}"
+                    )
 
             exit_code = (
                 channel.recv_exit_status()
             )
 
-            self._append_worker_output(
-                f"SteamCMD exited with code "
-                f"{exit_code}"
-            )
+            if exit_code == 0:
+                self._append_worker_output(
+                    "SteamCMD finished successfully."
+                )
+            else:
+                self._append_worker_output(
+                    f"SteamCMD FAILED with exit code "
+                    f"{exit_code}."
+                )
 
             return exit_code
 
@@ -3719,8 +4032,8 @@ class ModsPanel(QWidget):
             name = workshop_id
 
         self._append_log(
-            f"Downloading Workshop item "
-            f"{workshop_id}..."
+            f"Starting download/install for "
+            f"{name} ({workshop_id})..."
         )
 
         self.download_button.setEnabled(
@@ -3749,10 +4062,9 @@ class ModsPanel(QWidget):
 
                 self._refresh_installed_table()
 
-                # Check the newly installed mod immediately.
-                self.check_mod_updates(
-                    silent=True
-                )
+                # IMPORTANT:
+                # Do not automatically check for updates here.
+                # The user can press "Check Mod Updates" manually.
 
         def failure(error):
             self.download_button.setEnabled(
@@ -3783,6 +4095,11 @@ class ModsPanel(QWidget):
         steam_user,
         server_root,
     ):
+        self._append_worker_output(
+            f"Downloading Workshop item "
+            f"{workshop_id}..."
+        )
+
         exit_code = (
             self._run_steamcmd_live(
                 steamcmd_path,
@@ -3799,6 +4116,7 @@ class ModsPanel(QWidget):
             )
 
         self._append_worker_output(
+            "SteamCMD completed. "
             "Checking for downloaded Workshop content..."
         )
 
@@ -3837,6 +4155,28 @@ class ModsPanel(QWidget):
             f"Activated {key_count} key link(s)."
         )
 
+        try:
+            local_metadata = (
+                self._read_local_workshop_metadata(
+                    workshop_id
+                )
+            )
+        except Exception as exc:
+            self._append_worker_output(
+                f"WARNING: Could not read local Workshop "
+                f"metadata after install: {exc}"
+            )
+
+            local_metadata = None
+
+        local_time = (
+            local_metadata.get(
+                "timeupdated"
+            )
+            if local_metadata
+            else None
+        )
+
         existing = None
 
         for mod in self.config.mods:
@@ -3857,9 +4197,12 @@ class ModsPanel(QWidget):
                     "type": "mod",
                     "enabled": True,
                     "status": "installed",
-                    "update_status": "unknown",
-                    "local_workshop_time": None,
-                    "remote_workshop_time": None,
+                    # We just downloaded this content ourselves, so it
+                    # is up-to-date by definition -- no need to wait
+                    # for a separate "Check Mod Updates" pass.
+                    "update_status": "up-to-date",
+                    "local_workshop_time": local_time,
+                    "remote_workshop_time": local_time,
                 }
             )
 
@@ -3872,9 +4215,11 @@ class ModsPanel(QWidget):
             existing["status"] = "installed"
             existing["enabled"] = True
 
-            existing["update_status"] = "unknown"
-            existing["local_workshop_time"] = None
-            existing["remote_workshop_time"] = None
+            # We just downloaded this content ourselves, so it is
+            # up-to-date by definition.
+            existing["update_status"] = "up-to-date"
+            existing["local_workshop_time"] = local_time
+            existing["remote_workshop_time"] = local_time
 
             if "type" not in existing:
                 existing["type"] = "mod"
@@ -3884,6 +4229,277 @@ class ModsPanel(QWidget):
             )
 
         self.config.save()
+
+        self._append_worker_output(
+            "Download/install operation completed."
+        )
+
+        return True
+
+    # ==============================================================
+    # Update Selected Mod
+    # ==============================================================
+
+    def update_selected_mod(self):
+        if not self.ssh.is_connected():
+            QMessageBox.warning(
+                self,
+                "Not Connected",
+                "Connect to the DayZ server first.",
+            )
+            return
+
+        row = (
+            self.installed_table.currentRow()
+        )
+
+        if row < 0:
+            QMessageBox.information(
+                self,
+                "No Mod Selected",
+                "Select a mod to update first.",
+            )
+            return
+
+        if row >= len(
+            self.config.mods
+        ):
+            return
+
+        mod = self.config.mods[row]
+
+        workshop_id = str(
+            mod.get(
+                "id",
+                "",
+            )
+        ).strip()
+
+        name = str(
+            mod.get(
+                "name",
+                workshop_id,
+            )
+        ).strip()
+
+        if not workshop_id:
+            QMessageBox.warning(
+                self,
+                "Invalid Mod",
+                "The selected mod has no Workshop ID.",
+            )
+            return
+
+        steamcmd_path = (
+            self.config.steamcmd_path.strip()
+        )
+
+        server_root = (
+            self.config.server_root.strip()
+        )
+
+        steam_user = (
+            self.config.steam_user.strip()
+        )
+
+        if not steam_user:
+            QMessageBox.warning(
+                self,
+                "Steam Username Required",
+                "Set your Steam username in Settings "
+                "before updating Workshop content.",
+            )
+            return
+
+        if not steamcmd_path:
+            QMessageBox.warning(
+                self,
+                "SteamCMD Path Missing",
+                "Set the SteamCMD path in Settings.",
+            )
+            return
+
+        if not server_root:
+            QMessageBox.warning(
+                self,
+                "Server Root Missing",
+                "Set the DayZ server root in Settings.",
+            )
+            return
+
+        self._append_log(
+            f"Updating selected mod: "
+            f"{name} ({workshop_id})..."
+        )
+
+        self.update_selected_button.setEnabled(
+            False
+        )
+
+        def task():
+            return self._update_mod_worker(
+                workshop_id,
+                steamcmd_path,
+                steam_user,
+                server_root,
+            )
+
+        def success(result):
+            self.update_selected_button.setEnabled(
+                self._connected
+            )
+
+            if result:
+                try:
+                    local_metadata = (
+                        self._read_local_workshop_metadata(
+                            workshop_id
+                        )
+                    )
+                except Exception as exc:
+                    self._append_worker_output(
+                        f"WARNING: Could not read local "
+                        f"Workshop metadata after update: "
+                        f"{exc}"
+                    )
+
+                    local_metadata = None
+
+                local_time = (
+                    local_metadata.get(
+                        "timeupdated"
+                    )
+                    if local_metadata
+                    else None
+                )
+
+                # We just downloaded this content ourselves, so it is
+                # up-to-date by definition.
+                mod["update_status"] = "up-to-date"
+                mod["local_workshop_time"] = local_time
+                mod["remote_workshop_time"] = local_time
+                mod["status"] = "installed"
+
+                self.config.save()
+
+                self._refresh_installed_table()
+
+                if (
+                    0 <= row
+                    < self.installed_table.rowCount()
+                ):
+                    self.installed_table.selectRow(
+                        row
+                    )
+
+                self._append_log(
+                    f"Mod {name} ({workshop_id}) "
+                    "updated successfully."
+                )
+
+        def failure(error):
+            self.update_selected_button.setEnabled(
+                self._connected
+            )
+
+            self._append_log(
+                f"ERROR updating {name} "
+                f"({workshop_id}): {error}"
+            )
+
+            QMessageBox.critical(
+                self,
+                "Mod Update Failed",
+                str(error),
+            )
+
+        self.jobs.start(
+            task,
+            on_ok=success,
+            on_fail=failure,
+        )
+
+    def _update_mod_worker(
+        self,
+        workshop_id,
+        steamcmd_path,
+        steam_user,
+        server_root,
+    ):
+        self._append_worker_output(
+            ""
+        )
+
+        self._append_worker_output(
+            f"Starting Workshop update for "
+            f"{workshop_id}..."
+        )
+
+        exit_code = (
+            self._run_steamcmd_live(
+                steamcmd_path,
+                steam_user,
+                server_root,
+                workshop_id,
+            )
+        )
+
+        if exit_code != 0:
+            raise RuntimeError(
+                f"SteamCMD failed with exit code "
+                f"{exit_code}."
+            )
+
+        self._append_worker_output(
+            "SteamCMD update command completed."
+        )
+
+        workshop_path = (
+            self._find_remote_workshop_item(
+                workshop_id
+            )
+        )
+
+        if not workshop_path:
+            raise RuntimeError(
+                "Workshop content folder was not found "
+                "after the update."
+            )
+
+        self._append_worker_output(
+            "Updated Workshop content found:"
+        )
+
+        self._append_worker_output(
+            workshop_path
+        )
+
+        self._append_worker_output(
+            "Refreshing mod symlink..."
+        )
+
+        self._create_mod_symlink(
+            workshop_id
+        )
+
+        self._append_worker_output(
+            "Refreshing mod key links..."
+        )
+
+        key_count = (
+            self._install_mod_keys(
+                workshop_id
+            )
+        )
+
+        self._append_worker_output(
+            f"Activated {key_count} key link(s)."
+        )
+
+        self._append_worker_output(
+            f"Workshop update completed for "
+            f"{workshop_id}."
+        )
 
         return True
 
@@ -3929,12 +4545,20 @@ class ModsPanel(QWidget):
         if not workshop_id:
             return
 
+        self.resync_keys_button.setEnabled(
+            False
+        )
+
         def task():
             return self._resync_keys_worker(
                 workshop_id
             )
 
         def success(count):
+            self.resync_keys_button.setEnabled(
+                self._connected
+            )
+
             self._append_log(
                 f"Key re-sync complete. "
                 f"Linked {count} key file(s)."
@@ -3943,6 +4567,10 @@ class ModsPanel(QWidget):
             self._refresh_installed_table()
 
         def failure(error):
+            self.resync_keys_button.setEnabled(
+                self._connected
+            )
+
             self._append_log(
                 f"ERROR: {error}"
             )
