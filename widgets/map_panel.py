@@ -1,6 +1,8 @@
 from pathlib import Path
 from urllib.request import Request, urlopen
 import json
+import re
+import shlex
 
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QPalette
@@ -11,6 +13,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QLabel,
     QSizePolicy,
+    QSpinBox,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
@@ -79,6 +82,69 @@ class MapPanel(QWidget):
             24,
         )
 
+        # ====================================================
+        # HEATMAP TRACKING SETTINGS
+        # ====================================================
+
+        self.heatmap_label = QLabel(
+            "Heatmap Tracking:"
+        )
+
+        self.player_heatmap_label = QLabel(
+            "Player:"
+        )
+
+        self.player_heatmap_spin = QSpinBox()
+
+        self.player_heatmap_spin.setRange(
+            1,
+            86400,
+        )
+
+        self.player_heatmap_spin.setValue(
+            120
+        )
+
+        self.player_heatmap_spin.setSuffix(
+            " seconds"
+        )
+
+        self.player_heatmap_spin.setFixedWidth(
+            115
+        )
+
+        self.vehicle_heatmap_label = QLabel(
+            "Vehicle:"
+        )
+
+        self.vehicle_heatmap_spin = QSpinBox()
+
+        self.vehicle_heatmap_spin.setRange(
+            1,
+            86400,
+        )
+
+        self.vehicle_heatmap_spin.setValue(
+            30
+        )
+
+        self.vehicle_heatmap_spin.setSuffix(
+            " seconds"
+        )
+
+        self.vehicle_heatmap_spin.setFixedWidth(
+            115
+        )
+
+        self.apply_heatmap_button = QPushButton(
+            "Apply"
+        )
+
+        self.apply_heatmap_button.setFixedSize(
+            70,
+            24,
+        )
+
         self.status_label = QLabel(
             "Map assets can be downloaded below."
         )
@@ -89,12 +155,14 @@ class MapPanel(QWidget):
         )
 
         controls = QHBoxLayout()
+
         controls.setContentsMargins(
             4,
             2,
             4,
             2,
         )
+
         controls.setSpacing(6)
 
         controls.addWidget(
@@ -103,6 +171,34 @@ class MapPanel(QWidget):
 
         controls.addWidget(
             self.fetch_button
+        )
+
+        controls.addSpacing(
+            12
+        )
+
+        controls.addWidget(
+            self.heatmap_label
+        )
+
+        controls.addWidget(
+            self.player_heatmap_label
+        )
+
+        controls.addWidget(
+            self.player_heatmap_spin
+        )
+
+        controls.addWidget(
+            self.vehicle_heatmap_label
+        )
+
+        controls.addWidget(
+            self.vehicle_heatmap_spin
+        )
+
+        controls.addWidget(
+            self.apply_heatmap_button
         )
 
         controls.addWidget(
@@ -226,6 +322,10 @@ class MapPanel(QWidget):
             self.fetch_heatmap_data
         )
 
+        self.apply_heatmap_button.clicked.connect(
+            self.apply_heatmap_settings
+        )
+
         index_file = (
             self.map_dir
             / "index.html"
@@ -260,6 +360,289 @@ class MapPanel(QWidget):
         else:
             self.status_label.setText(
                 "Map assets can be downloaded below."
+            )
+
+    # ========================================================
+    # HEATMAP TRACKING SETTINGS
+    # ========================================================
+
+    def apply_heatmap_settings(self):
+        """
+        Write the heatmap tracking settings to:
+
+            <server_root>/serverDZ.cfg
+
+        The DayZ systemd service MUST NOT be active.
+
+        The service is checked using:
+
+            systemctl is-active <configured service>
+
+        No attempt is made to stop, start, or restart the service.
+        """
+
+        if not self.ssh.is_connected():
+            print(
+                "MapPanel: SSH is not connected."
+            )
+
+            self.status_label.setText(
+                "Not connected. Connect to the server first."
+            )
+
+            return
+
+        service_name = getattr(
+            self.config,
+            "systemd_service",
+            "",
+        )
+
+        if not service_name:
+            print(
+                "MapPanel: systemd service is not configured."
+            )
+
+            self.status_label.setText(
+                "Cannot apply settings: systemd service is not configured."
+            )
+
+            return
+
+        self.apply_heatmap_button.setEnabled(
+            False
+        )
+
+        self.status_label.setText(
+            "Checking DayZ service status..."
+        )
+
+        try:
+            # ------------------------------------------------
+            # CHECK WHETHER THE DAYZ SERVICE IS RUNNING
+            # ------------------------------------------------
+
+            active_command = (
+                "systemctl is-active "
+                + shlex.quote(
+                    service_name
+                )
+                + " 2>/dev/null || true"
+            )
+
+            (
+                active_code,
+                active_out,
+                active_err,
+            ) = self.ssh.exec(
+                active_command
+            )
+
+            active_lines = (
+                (active_out or "")
+                .strip()
+                .splitlines()
+            )
+
+            if active_lines:
+                active_state = (
+                    active_lines[0]
+                    .strip()
+                    .lower()
+                )
+            else:
+                active_state = "unknown"
+
+            print(
+                f"MapPanel: DayZ service "
+                f"'{service_name}' state: "
+                f"{active_state}"
+            )
+
+            # ------------------------------------------------
+            # DO NOT MODIFY CONFIG WHILE SERVER IS RUNNING
+            # ------------------------------------------------
+
+            if active_state == "active":
+
+                print(
+                    "MapPanel: Refusing to modify "
+                    "serverDZ.cfg because the "
+                    "DayZ service is running."
+                )
+
+                self.status_label.setText(
+                    "Server is running. Stop the DayZ server before applying settings."
+                )
+
+                return
+
+            # ------------------------------------------------
+            # FIND SERVER ROOT
+            # ------------------------------------------------
+
+            server_root = getattr(
+                self.config,
+                "server_root",
+                "",
+            )
+
+            if not server_root:
+                print(
+                    "MapPanel: server_root is not configured."
+                )
+
+                self.status_label.setText(
+                    "Cannot apply settings: server root is not configured."
+                )
+
+                return
+
+            remote_cfg_path = (
+                server_root.rstrip("/")
+                + "/serverDZ.cfg"
+            )
+
+            player_value = (
+                self.player_heatmap_spin.value()
+            )
+
+            vehicle_value = (
+                self.vehicle_heatmap_spin.value()
+            )
+
+            self.status_label.setText(
+                "Reading serverDZ.cfg..."
+            )
+
+            print(
+                f"MapPanel: Reading "
+                f"{remote_cfg_path}"
+            )
+
+            # ------------------------------------------------
+            # READ REMOTE CONFIG
+            # ------------------------------------------------
+
+            cfg_text = self.ssh.read_file(
+                remote_cfg_path
+            )
+
+            # ------------------------------------------------
+            # UPDATE PLAYER SETTING
+            # ------------------------------------------------
+
+            player_pattern = re.compile(
+                r"^(\s*heatmapTickTime\s*=\s*)[^;]+(;.*)$",
+                re.MULTILINE,
+            )
+
+            player_replacement = (
+                rf"\g<1>{player_value}\g<2>"
+            )
+
+            cfg_text, player_count = (
+                player_pattern.subn(
+                    player_replacement,
+                    cfg_text,
+                )
+            )
+
+            # ------------------------------------------------
+            # UPDATE VEHICLE SETTING
+            # ------------------------------------------------
+
+            vehicle_pattern = re.compile(
+                r"^(\s*heatmapTickTimeVehicle\s*=\s*)[^;]+(;.*)$",
+                re.MULTILINE,
+            )
+
+            vehicle_replacement = (
+                rf"\g<1>{vehicle_value}\g<2>"
+            )
+
+            cfg_text, vehicle_count = (
+                vehicle_pattern.subn(
+                    vehicle_replacement,
+                    cfg_text,
+                )
+            )
+
+            # ------------------------------------------------
+            # ADD MISSING SETTINGS
+            # ------------------------------------------------
+
+            additions = []
+
+            if player_count == 0:
+                additions.append(
+                    f"heatmapTickTime = {player_value};"
+                )
+
+            if vehicle_count == 0:
+                additions.append(
+                    f"heatmapTickTimeVehicle = {vehicle_value};"
+                )
+
+            if additions:
+
+                if cfg_text and not cfg_text.endswith(
+                    "\n"
+                ):
+                    cfg_text += "\n"
+
+                cfg_text += (
+                    "\n"
+                    + "\n".join(
+                        additions
+                    )
+                    + "\n"
+                )
+
+            # ------------------------------------------------
+            # WRITE REMOTE CONFIG
+            # ------------------------------------------------
+
+            self.status_label.setText(
+                "Writing serverDZ.cfg..."
+            )
+
+            print(
+                f"MapPanel: Writing "
+                f"{remote_cfg_path}"
+            )
+
+            self.ssh.write_file(
+                remote_cfg_path,
+                cfg_text,
+            )
+
+            print(
+                "MapPanel: Heatmap tracking settings "
+                "updated successfully."
+            )
+
+            self.status_label.setText(
+                f"Heatmap settings applied: "
+                f"Player {player_value}s, "
+                f"Vehicle {vehicle_value}s"
+            )
+
+        except Exception as e:
+
+            print(
+                f"MapPanel: Failed to apply "
+                f"heatmap settings: {e}"
+            )
+
+            self.status_label.setText(
+                f"Heatmap settings failed: {e}"
+            )
+
+        finally:
+
+            self.apply_heatmap_button.setEnabled(
+                True
             )
 
     # ========================================================

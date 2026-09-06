@@ -169,6 +169,10 @@ class DeployPanel(QWidget):
     # emitting it from the GUI thread would deadlock.
     credential_dialog_requested = Signal(str, str)
 
+    # Emitted whenever the known dzmanager.pbo deployment state
+    # changes. MainWindow uses this to show or hide the Map tab.
+    pbo_deployment_changed = Signal(bool)
+
     def __init__(
         self,
         ssh,
@@ -282,8 +286,7 @@ class DeployPanel(QWidget):
             "package manager/AUR. For an Arch package installation, "
             "use 'steamcmd' in the SteamCMD field. The app will "
             "resolve it through the remote user's PATH.\n\n"
-            "DayZ dedicated server files can be downloaded anonymously. "
-            "A Steam account is only required if you specifically need "
+            "The dzmanager.pbo is needed if you want to use FPS logging and Heatmap support. "
             "one for your setup.\n\n"
             "If this account has never logged in via SteamCMD on this "
             "server before, SteamCMD will need a password and/or a "
@@ -615,9 +618,42 @@ class DeployPanel(QWidget):
             self.deploy_systemd_btn
         )
 
+        systemd_row.addStretch()
+
+        layout.addLayout(
+            systemd_row
+        )
+
+        # ----------------------------------------------------
+        # dzmanager.pbo status indicator
+        # ----------------------------------------------------
+
+        self.pbo_indicator = QLabel(
+            "●"
+        )
+
+        self.pbo_status = QLabel(
+            "dzmanager.pbo: (connect first)"
+        )
+
+        self.pbo_indicator.setFixedWidth(
+            18
+        )
+
+        pbo_status_row = self._make_status_row(
+            self.pbo_indicator,
+            self.pbo_status,
+        )
+
+        layout.addLayout(
+            pbo_status_row
+        )
+
         # ----------------------------------------------------
         # Deploy dzmanager.pbo
         # ----------------------------------------------------
+
+        pbo_row = QHBoxLayout()
 
         self.deploy_pbo_btn = QPushButton(
             "Deploy dzmanager.pbo"
@@ -633,14 +669,14 @@ class DeployPanel(QWidget):
             self.deploy_dzmanager_pbo
         )
 
-        systemd_row.addWidget(
+        pbo_row.addWidget(
             self.deploy_pbo_btn
         )
 
-        systemd_row.addStretch()
+        pbo_row.addStretch()
 
         layout.addLayout(
-            systemd_row
+            pbo_row
         )
 
         # ----------------------------------------------------
@@ -781,9 +817,7 @@ class DeployPanel(QWidget):
 
             self._reset_systemd_status()
 
-            self._set_pbo_button_state(
-                False
-            )
+            self._reset_pbo_status()
 
     # ========================================================
     # CONFIG REFRESH
@@ -1194,6 +1228,31 @@ class DeployPanel(QWidget):
         self.systemd_valid_status.setStyleSheet("")
         self.systemd_enabled_status.setStyleSheet("")
         self.systemd_running_status.setStyleSheet("")
+
+    def _reset_pbo_status(self):
+        self._pbo_deployed = False
+
+        self.deploy_pbo_btn.setText(
+            "Deploy dzmanager.pbo"
+        )
+
+        self._set_indicator_neutral(
+            self.pbo_indicator
+        )
+
+        self.pbo_status.setText(
+            "dzmanager.pbo: (connect first)"
+        )
+
+        self.pbo_status.setStyleSheet(
+            ""
+        )
+
+        # Tell MainWindow that the PBO is no longer known to be
+        # deployed because the SSH connection was disconnected.
+        self.pbo_deployment_changed.emit(
+            False
+        )
 
     def _display_systemd_status(self, result):
         exists = result.get("exists")
@@ -1665,6 +1724,18 @@ class DeployPanel(QWidget):
             self.systemd_running_indicator
         )
 
+        self.pbo_status.setText(
+            "dzmanager.pbo: checking..."
+        )
+
+        self.pbo_status.setStyleSheet(
+            ""
+        )
+
+        self._set_indicator_neutral(
+            self.pbo_indicator
+        )
+
         def task():
             detected = self._detect_steamcmd(
                 steamcmd_config
@@ -1820,13 +1891,29 @@ class DeployPanel(QWidget):
         )
 
         if pbo_deployed is None:
+            error_text = (
+                result.get("pbo_check_error")
+                or "unknown error"
+            )
+
             self._append(
                 "dzmanager.pbo status could not be "
                 "confirmed, leaving button as-is: "
-                + (
-                    result.get("pbo_check_error")
-                    or "unknown error"
-                )
+                + error_text
+            )
+
+            self._set_indicator_orange(
+                self.pbo_indicator
+            )
+
+            self.pbo_status.setText(
+                "dzmanager.pbo: status unknown "
+                f"({error_text})"
+            )
+
+            self.pbo_status.setStyleSheet(
+                "color: #FF9800;"
+                "font-weight: bold;"
             )
 
         else:
@@ -3619,6 +3706,19 @@ class DeployPanel(QWidget):
             "Uninstall dzmanager.pbo"
             if self._pbo_deployed
             else "Deploy dzmanager.pbo"
+        )
+
+        self._set_systemd_item(
+            self.pbo_indicator,
+            self.pbo_status,
+            self._pbo_deployed,
+            green_text="dzmanager.pbo: deployed",
+            red_text="dzmanager.pbo: not deployed",
+        )
+
+        # Tell MainWindow about the existing PBO state.
+        self.pbo_deployment_changed.emit(
+            self._pbo_deployed
         )
 
     def _check_pbo_deployed(self, remote_path):

@@ -107,6 +107,9 @@ class MainWindow(QMainWindow):
         #
         # MapPanel derives this path from AppConfig rather than
         # hard-coding the server or profiles directory.
+        #
+        # The Map tab is hidden unless dzmanager.pbo has been
+        # successfully deployed to the server.
 
         self.map_panel = MapPanel(
             self.ssh,
@@ -135,6 +138,24 @@ class MainWindow(QMainWindow):
             self.ssh,
             self.config,
             sudo_password_getter=sudo_password_getter,
+        )
+
+        # ====================================================
+        # PBO -> MAP VISIBILITY
+        # ====================================================
+        #
+        # DeployPanel owns the authoritative dzmanager.pbo
+        # deployment state.
+        #
+        # The Map tab remains hidden until DeployPanel confirms
+        # that dzmanager.pbo is deployed.
+        #
+        # When the PBO is deployed or uninstalled, DeployPanel
+        # emits pbo_deployment_changed(bool), which updates the
+        # Map tab visibility.
+
+        self.deploy_panel.pbo_deployment_changed.connect(
+            self._update_map_tab_visibility
         )
 
         # ====================================================
@@ -290,11 +311,6 @@ class MainWindow(QMainWindow):
         )
 
         self.tabs.addTab(
-            self.map_panel,
-            "Map",
-        )
-
-        self.tabs.addTab(
             self.deploy_panel,
             "Deploy",
         )
@@ -307,6 +323,40 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(
             self.rcon_panel,
             "RCON",
+        )
+
+        # ====================================================
+        # MAP TAB
+        # ====================================================
+        #
+        # Map is intentionally added LAST so it appears at the
+        # far right of the tab bar, after RCON.
+        #
+        # It is hidden by default and is only made visible after
+        # dzmanager.pbo has been confirmed as deployed.
+
+        self.map_tab_index = self.tabs.addTab(
+            self.map_panel,
+            "Map",
+        )
+
+        self.tabs.setTabVisible(
+            self.map_tab_index,
+            False,
+        )
+
+        # Apply the current PBO state in case DeployPanel already
+        # knows the deployment state.
+        #
+        # Normally this will still be False until the first
+        # connected status check completes.
+
+        self._update_map_tab_visibility(
+            getattr(
+                self.deploy_panel,
+                "_pbo_deployed",
+                False,
+            )
         )
 
         self.setCentralWidget(
@@ -338,6 +388,26 @@ class MainWindow(QMainWindow):
             self.maintenance_panel,
             self.map_panel,
         ]
+
+    # ========================================================
+    # MAP TAB VISIBILITY
+    # ========================================================
+
+    def _update_map_tab_visibility(self, deployed):
+        """
+        Show the Map tab only when dzmanager.pbo is deployed.
+        """
+
+        if not hasattr(
+            self,
+            "map_tab_index",
+        ):
+            return
+
+        self.tabs.setTabVisible(
+            self.map_tab_index,
+            bool(deployed),
+        )
 
     # ========================================================
     # CONNECTION STATE
