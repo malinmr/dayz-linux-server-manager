@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+<title>DayZ Heatmap</title>
+</head>
+
+<body>
+
+<style>
+html,
+body {
+  background: transparent;
+  margin: 0;
+  padding: 0;
+  text-align: center;
+
+  scrollbar-width: thin;
+  scrollbar-color: #666666 transparent;
+}
+
+/* Chromium / Qt WebEngine scrollbar */
+
+::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: #666666;
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: #888888;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Force the document scrollbar itself */
+
+html::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+
+html::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+html::-webkit-scrollbar-thumb {
+  background-color: #666666;
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+html::-webkit-scrollbar-thumb:hover {
+  background-color: #888888;
+}
+
+html::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+body::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+
+body::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+body::-webkit-scrollbar-thumb {
+  background-color: #666666;
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+body::-webkit-scrollbar-thumb:hover {
+  background-color: #888888;
+}
+
+body::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+#mapImage {
+  margin: auto;
+  width: 1000px;
+  height: 1000px;
+  background-size: 100% 100%;
+  outline: black 3px solid;
+}
+
+p {
+  margin-top: 8px;
+  margin-bottom: 8px;
+}
+
+.mapButton {
+  margin: 4px;
+  padding: 4px 12px;
+}
+
+</style>
+
+<p>
+Select map:
+<select name="mapSelect" id="mapSelect" onchange="changeMap()">
+<option value="Chernarus">Chernarus</option>
+<option value="Enoch">Livonia</option>
+<option value="Esseker">Esseker</option>
+<option value="Local Map">Local Map</option>
+</select>
+</p>
+
+<div>
+Time:
+<input
+  id="timeSlider"
+  type="range"
+  min="0"
+  max="1"
+  value="1"
+  step="0.01"
+>
+</div>
+
+<br/>
+
+<div id="dropbox">
+
+<div id="mapImage">
+<canvas
+  id="mapCanvas"
+  width="1000"
+  height="1000"
+>
+</canvas>
+</div>
+
+<br/>
+
+<input
+  class="mapButton"
+  type="button"
+  onClick="save();"
+  value="Save Map"
+>
+
+<input
+  class="mapButton"
+  type="button"
+  onClick="clearAll();"
+  value="Clear All"
+>
+
+</div>
+
+<!-- Local copies downloaded by MapPanel -->
+<script src="assets/html2canvas.min.js"></script>
+<script src="assets/FileSaver.min.js"></script>
+
+<script>
+
+var mapSize = new Map();
+
+mapSize.set("Chernarus", 15360);
+mapSize.set("Enoch", 12800);
+mapSize.set("Esseker", 12800);
+
+var mapImage = new Map();
+
+mapImage.set(
+  "Chernarus",
+  "assets/ChernarusPlus/map.png"
+);
+
+mapImage.set(
+  "Enoch",
+  "assets/Enoch/map.png"
+);
+
+mapImage.set(
+  "Esseker",
+  "assets/Esseker/map.png"
+);
+
+var waypoints = new Array();
+var deathpoints = new Array();
+var maxTime = 0.0;
+
+changeMap();
+
+let dropbox = document.getElementById("dropbox");
+
+dropbox.addEventListener(
+  "dragover",
+  dragover,
+  false
+);
+
+dropbox.addEventListener(
+  "drop",
+  drop,
+  false
+);
+
+
+function changeMap() {
+
+  let canvas = document.getElementById("mapCanvas");
+  let ctx = canvas.getContext("2d");
+
+  ctx.clearRect(
+    0,
+    0,
+    canvas.width,
+    canvas.height
+  );
+
+  let mapSelect = document.getElementById("mapSelect");
+
+  let value = mapSelect.value;
+
+  if (mapImage.has(value)) {
+
+    let url = mapImage.get(value);
+
+    document.getElementById(
+      "mapImage"
+    ).style.backgroundImage =
+      "url('" + url + "')";
+
+  }
+  else {
+
+    loadLocalMap();
+
+    let size = prompt(
+      "Size of the map",
+      "12800"
+    );
+
+    if (size !== null) {
+      mapSize.set(
+        "Local Map",
+        parseInt(size)
+      );
+    }
+  }
+
+  drawHeatmap(
+    document.getElementById("timeSlider").value
+  );
+}
+
+
+function loadLocalMap() {
+
+  let input = document.createElement("input");
+
+  input.type = "file";
+  input.accept = ".jpg, .png, .jpeg";
+
+  input.onchange = _ => {
+
+    let files = Array.from(input.files);
+
+    const reader = new FileReader();
+
+    reader.onloadend = function() {
+
+      document.getElementById(
+        "mapImage"
+      ).style.backgroundImage =
+        "url('" + reader.result + "')";
+    }
+
+    if (files[0]) {
+      reader.readAsDataURL(files[0]);
+    }
+  };
+
+  input.click();
+}
+
+
+function dragover(e) {
+
+  e.preventDefault();
+}
+
+
+function drop(e) {
+
+  e.stopPropagation();
+  e.preventDefault();
+
+  const dt = e.dataTransfer;
+  const files = dt.files;
+
+  waypoints = new Array();
+  deathpoints = new Array();
+
+  let filesLoaded = 0;
+
+  for (let i = 0; i < files.length; i++) {
+
+    const reader = new FileReader();
+
+    reader.addEventListener(
+      "load",
+      (event) => {
+
+        let jsn = JSON.parse(
+          event.target.result
+        );
+
+        if (
+          Array.isArray(
+            jsn.m_WayPoints
+          )
+        ) {
+
+          for (
+            let i = 0;
+            i < jsn.m_WayPoints.length;
+            i++
+          ) {
+
+            waypoints.push(
+              jsn.m_WayPoints[i]
+            );
+          }
+        }
+
+        if (
+          Array.isArray(
+            jsn.m_DeathPoints
+          )
+        ) {
+
+          for (
+            let i = 0;
+            i < jsn.m_DeathPoints.length;
+            i++
+          ) {
+
+            deathpoints.push(
+              jsn.m_DeathPoints[i]
+            );
+          }
+        }
+
+        filesLoaded++;
+
+        if (
+          filesLoaded === files.length
+        ) {
+
+          document.getElementById(
+            "timeSlider"
+          ).value = "1.0";
+
+          lastTimeValue = 1.0;
+
+          maxTime = getMaxTime();
+
+          drawHeatmap(1.0);
+        }
+      }
+    );
+
+    reader.readAsText(files[i]);
+  }
+}
+
+
+function loadHeatmapData(data) {
+
+  if (!data) {
+    console.log(
+      "No heatmap data received."
+    );
+
+    return;
+  }
+
+  waypoints = new Array();
+  deathpoints = new Array();
+
+  if (
+    Array.isArray(
+      data.m_WayPoints
+    )
+  ) {
+
+    for (
+      let i = 0;
+      i < data.m_WayPoints.length;
+      i++
+    ) {
+
+      waypoints.push(
+        data.m_WayPoints[i]
+      );
+    }
+  }
+
+  if (
+    Array.isArray(
+      data.m_DeathPoints
+    )
+  ) {
+
+    for (
+      let i = 0;
+      i < data.m_DeathPoints.length;
+      i++
+    ) {
+
+      deathpoints.push(
+        data.m_DeathPoints[i]
+      );
+    }
+  }
+
+  document.getElementById(
+    "timeSlider"
+  ).value = "1.0";
+
+  lastTimeValue = 1.0;
+
+  maxTime = getMaxTime();
+
+  drawHeatmap(1.0);
+
+  console.log(
+    "Heatmap data applied."
+  );
+}
+
+
+function getMaxTime() {
+
+  let max = 0.0;
+
+  for (
+    let i = 0;
+    i < waypoints.length;
+    i++
+  ) {
+
+    let playerwaypoints = waypoints[i];
+
+    for (
+      let j = 0;
+      j < playerwaypoints.length;
+      j++
+    ) {
+
+      max = Math.max(
+        max,
+        playerwaypoints[j][1]
+      );
+    }
+  }
+
+  for (
+    let i = 0;
+    i < deathpoints.length;
+    i++
+  ) {
+
+    max = Math.max(
+      max,
+      deathpoints[i][1]
+    );
+  }
+
+  console.log(max);
+
+  return max;
+}
+
+
+var lastTimeValue = 1.0;
+
+var inp = document.getElementById(
+  "timeSlider"
+);
+
+inp.addEventListener(
+  "input",
+  function () {
+
+    if (this.value != lastTimeValue) {
+
+      lastTimeValue = this.value;
+
+      drawHeatmap(
+        this.value
+      );
+    }
+  }
+);
+
+
+function drawHeatmap(time) {
+
+  let mapSelect = document.getElementById(
+    "mapSelect"
+  );
+
+  let value = mapSelect.value;
+
+  let size = mapSize.get(value);
+
+  if (!size) {
+    return;
+  }
+
+  let canvas = document.getElementById(
+    "mapCanvas"
+  );
+
+  let ctx = canvas.getContext("2d");
+
+  ctx.clearRect(
+    0,
+    0,
+    canvas.width,
+    canvas.height
+  );
+
+  if (waypoints.length > 0 && maxTime > 0) {
+
+    ctx.globalAlpha = Math.max(
+      1.0 / waypoints.length,
+      0.1
+    );
+
+    for (
+      let i = 0;
+      i < waypoints.length;
+      i++
+    ) {
+
+      let playerwaypoints = waypoints[i];
+
+      ctx.beginPath();
+
+      ctx.lineWidth = "3";
+      ctx.strokeStyle = "red";
+
+      let firstPoint = true;
+
+      for (
+        let j = 0;
+        j < playerwaypoints.length;
+        j++
+      ) {
+
+        let waypoint =
+          playerwaypoints[j];
+
+        if (
+          waypoint[1] / maxTime > time
+        ) {
+          continue;
+        }
+
+        let x =
+          canvas.width / size *
+          waypoint[0];
+
+        let y =
+          canvas.height -
+          (
+            canvas.height / size *
+            waypoint[2]
+          );
+
+        if (firstPoint) {
+
+          ctx.moveTo(x, y);
+
+          firstPoint = false;
+
+        }
+        else {
+
+          ctx.lineTo(x, y);
+        }
+      }
+
+      ctx.stroke();
+    }
+  }
+
+  ctx.globalAlpha = 1.0;
+
+  for (
+    let i = 0;
+    i < deathpoints.length;
+    i++
+  ) {
+
+    let waypoint = deathpoints[i];
+
+    if (
+      maxTime > 0 &&
+      waypoint[1] / maxTime > time
+    ) {
+      continue;
+    }
+
+    let x =
+      canvas.width / size *
+      waypoint[0];
+
+    let y =
+      canvas.height -
+      (
+        canvas.height / size *
+        waypoint[2]
+      );
+
+    ctx.beginPath();
+
+    ctx.lineWidth = "2";
+    ctx.strokeStyle = "yellow";
+
+    ctx.arc(
+      x,
+      y,
+      canvas.width * 0.0015,
+      0,
+      2 * Math.PI
+    );
+
+    ctx.stroke();
+  }
+}
+
+
+function clearAll() {
+
+  waypoints = new Array();
+
+  deathpoints = new Array();
+
+  maxTime = 0.0;
+
+  document.getElementById(
+    "timeSlider"
+  ).value = "1.0";
+
+  lastTimeValue = 1.0;
+
+  let canvas = document.getElementById(
+    "mapCanvas"
+  );
+
+  let ctx = canvas.getContext("2d");
+
+  ctx.clearRect(
+    0,
+    0,
+    canvas.width,
+    canvas.height
+  );
+
+  console.log(
+    "Heatmap data cleared."
+  );
+}
+
+
+function save() {
+
+  html2canvas(
+    document.getElementById("mapImage"),
+    {
+      allowTaint: true
+    }
+  ).then(canvas => {
+
+    canvas.toBlob(
+      function(blob) {
+
+        if (!blob) {
+          console.log(
+            "Failed to create map image."
+          );
+          return;
+        }
+
+        let mapSelect =
+          document.getElementById(
+            "mapSelect"
+          );
+
+        let mapName =
+          mapSelect.value
+            .replace(
+              /[^a-z0-9_-]/gi,
+              "_"
+            );
+
+        let filename =
+          "DayZ_Heatmap_" +
+          mapName +
+          ".png";
+
+        saveAs(
+          blob,
+          filename
+        );
+
+      },
+      "image/png"
+    );
+
+  }).catch(
+    function(error) {
+
+      console.log(
+        "Failed to save map:",
+        error
+      );
+
+    }
+  );
+}
+
+</script>
+
+</body>
+</html>
